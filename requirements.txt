@@ -1,0 +1,31 @@
+## Requirements (pip install, or use CC wheelhouse on Narval)
+
+# Core
+numpy>=1.24
+pandas>=2.0
+openpyxl>=3.1          # Excel reader
+scipy>=1.11
+
+# ML
+torch>=2.0             # use --no-index on Narval (CC wheelhouse)
+scikit-learn>=1.3
+
+# LLM (for Mistral-7B on Narval A100)
+transformers>=4.40
+accelerate>=0.29
+huggingface_hub>=0.22
+
+# Optimization (optional, for full SOCP attack model)
+# cvxpy>=1.4           # if you want to solve the exact SOCP
+
+# Visualization (optional)
+matplotlib>=3.7
+seaborn>=0.12
+
+# ── Narval install commands ────────────────────────────────────────────────
+# module load StdEnv/2023 python/3.10.13 cuda/12.2
+# virtualenv --no-download ~/ENV
+# source ~/ENV/bin/activate
+# pip install --no-index torch torchvision
+# pip install --no-index numpy pandas openpyxl scipy scikit-learn
+# pip install transformers accelerate huggingface_hub   # may need --no-index
