@@ -9,8 +9,8 @@ import os
 # ─── Paths ────────────────────────────────────────────────────────────────────
 BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR        = os.path.join(BASE_DIR, "data")
-RESULTS_DIR     = os.path.join(BASE_DIR, "results")
-MODEL_DIR       = os.path.join(BASE_DIR, "models")
+RESULTS_DIR     = "/home/gkianfar/scratch/Amin/CB/results"
+MODEL_DIR       = "/home/gkianfar/scratch/Amin/CB/models"
 LLM_DIR         = os.path.join(BASE_DIR, "llm")
 
 #  IEEE 69-bus Excel file path — update this
