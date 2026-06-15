@@ -21,7 +21,7 @@ module load cuda/12.2
 source /home/gkianfar/scratch/Amin/ENV/bin/activate
 
 # ── Project directory ──────────────────────────────────────────────────────
-PROJECT_DIR="/home/gkianfar/scratch/Amin/fdi_detection"
+PROJECT_DIR="/home/gkianfar/scratch/Amin/CB/Cyber"
 cd $PROJECT_DIR
 
 mkdir -p logs results models
@@ -51,7 +51,7 @@ echo "============================================================"
 #     --local-dir /home/gkianfar/scratch/Amin/llm_cache/phi-3-mini-4k-instruct
 
 # ── Run experiment ─────────────────────────────────────────────────────────
-EXCEL_PATH="/home/gkianfar/scratch/Amin/fdi_detection/data/ieee69bus.xlsx"
+EXCEL_PATH="/home/gkianfar/scratch/Amin/CB/IEEE 69 bus.xlsx"
 
 echo "Starting FDI detection experiment..."
 python main_train.py \
