@@ -13,8 +13,8 @@ RESULTS_DIR     = os.path.join(BASE_DIR, "results")
 MODEL_DIR       = os.path.join(BASE_DIR, "models")
 LLM_DIR         = os.path.join(BASE_DIR, "llm")
 
-# Your IEEE 69-bus Excel file path — update this
-BUS_EXCEL_PATH  = os.path.join(DATA_DIR, "ieee69bus.xlsx")
+#  IEEE 69-bus Excel file path — update this
+BUS_EXCEL_PATH  = "/home/gkianfar/scratch/Amin/CB/IEEE 69 bus.xlsx"
 
 # Sheet names in your Excel (update to match your file)
 BUS_DATA_SHEET      = "BusData"       # columns: Bus, Type, Pd(kW), Qd(kVAr), Vbase(kV)
