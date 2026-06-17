@@ -171,4 +171,4 @@ def generate_daily_profiles(system: IEEE69BusSystem,
             reserve[day,t] = load_MW[day,t,:].sum() * 0.05
 
     print(f"[PowerFlow] Generated {n_days} days × {T}h profiles for {n} buses")
-    return load_MW, pv_MW, reserve
+    return load_MW, gen_MW, reserve, breakdown
