@@ -60,7 +60,8 @@ class DispatchPredictor:
         self.gen_buses = [0] + self.gen_buses
 
         # PV buses
-        self.pv_buses  = [b.bus_id-1 for b in system.buses if b.is_pv_bus]
+        self.der_buses = [b.bus_id - 1 for b in system.buses if b.der_type != "none"]
+        self.gen_buses = [0] + self.der_buses
 
         # Storage buses
         self.stor_buses = list(storage_config.keys())
