@@ -2,6 +2,10 @@
 IEEE 69-Bus System Data Loader
 Reads bus and branch data from your Excel file.
 Falls back to hardcoded IEEE 69-bus standard data if Excel not found.
+
+DG placement (WT/PV/Biomass) and micro-grid partition follow:
+  Wang et al., "Optimal planning of multi-micro grids based-on networks
+  reliability," Energy Reports 6 (2020) 1233-1249, Table 1 & Table 3.
 """
 
 import numpy as np
@@ -9,11 +13,15 @@ import pandas as pd
 import os
 import warnings
 from dataclasses import dataclass, field
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
 from config import (
     BUS_EXCEL_PATH, BUS_DATA_SHEET, BRANCH_DATA_SHEET,
-    S_BASE_MVA, V_BASE_KV, V_MIN_PU, V_MAX_PU
+    S_BASE_MVA, V_BASE_KV, V_MIN_PU, V_MAX_PU,
+    WT_BUSES, WT_CAPACITY_KW, WT_COST_USD_MWH,
+    PV_BUSES, PV_CAPACITY_KW, PV_COST_USD_MWH,
+    BM_BUSES, BM_CAPACITY_KW, BM_COST_USD_MWH,
+    MICROGRID_MAP, BUS_TO_MICROGRID,
 )
 
 
@@ -28,8 +36,24 @@ class BusData:
     Vbase_kV:   float = V_BASE_KV
     V_pu:       float = 1.0
     theta_rad:  float = 0.0
-    is_pv_bus:  bool  = False
-    Pv_MW:      float = 0.0   # PV generation capacity MW
+
+    # DER flags (CHANGED: replaced single is_pv_bus with explicit DER type)
+    der_type:   str   = "none"   # "none" | "WT" | "PV" | "BM"
+    der_capacity_MW: float = 0.0 # rated capacity of the DER at this bus
+
+    # Backward-compat property: old code checks `is_pv_bus`
+    @property
+    def is_pv_bus(self) -> bool:
+        return self.der_type == "PV"
+
+    @property
+    def Pv_MW(self) -> float:
+        """Backward-compat alias: renewable (PV or WT) capacity at this bus."""
+        return self.der_capacity_MW if self.der_type in ("PV", "WT") else 0.0
+
+    @property
+    def microgrid(self) -> str:
+        return BUS_TO_MICROGRID.get(self.bus_id, "UNASSIGNED")
 
 
 @dataclass
@@ -83,7 +107,6 @@ def load_ieee69_from_excel(excel_path: str) -> IEEE69BusSystem:
         warnings.warn(f"Could not read bus sheet: {e}. Using standard data.")
         return load_ieee69_standard()
 
-    # Flexible column name mapping
     col_map_bus = {
         "bus":      ["bus", "bus_id", "node", "bus no", "busno"],
         "type":     ["type", "bus_type", "bustype"],
@@ -140,7 +163,6 @@ def load_ieee69_from_excel(excel_path: str) -> IEEE69BusSystem:
     b_col      = find_col(df_br, col_map_br["b_s"])
     rate_col   = find_col(df_br, col_map_br["rating"])
 
-    # Base impedance for p.u. conversion
     Z_base = (V_BASE_KV ** 2) / S_BASE_MVA   # ohms
 
     branches = []
@@ -179,8 +201,6 @@ def load_ieee69_standard() -> IEEE69BusSystem:
     """
     print("[DataLoader] Using built-in IEEE 69-bus standard data.")
 
-    # Format: (bus_id, type, Pd_kW, Qd_kVAr)
-    # Bus 1 = slack (substation), type 3
     bus_raw = [
         (1,  3,  0.0,   0.0),
         (2,  1,  0.0,   0.0),
@@ -257,7 +277,6 @@ def load_ieee69_standard() -> IEEE69BusSystem:
                      Pd_MW=b[2]/1000.0, Qd_MVAr=b[3]/1000.0)
              for b in bus_raw]
 
-    # Format: (from, to, R_ohm, X_ohm)  — IEEE 69-bus standard impedances
     branch_raw = [
         (1,2,  0.0005, 0.0012), (2,3,  0.0005, 0.0012), (3,4,  0.0015, 0.0036),
         (4,5,  0.0251, 0.0294), (5,6,  0.3660, 0.1864), (6,7,  0.3810, 0.1941),
@@ -312,7 +331,7 @@ def _build_ybus(system: IEEE69BusSystem):
     Y = np.zeros((n, n), dtype=complex)
 
     for br in system.branches:
-        i = br.from_bus - 1   # 0-indexed
+        i = br.from_bus - 1
         j = br.to_bus   - 1
         y_ij = 1.0 / complex(br.R_pu, br.X_pu)
         b_sh  = 1j * br.B_pu / 2.0
@@ -325,38 +344,109 @@ def _build_ybus(system: IEEE69BusSystem):
     system.Y_bus = Y
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# CHANGED: assign_pv_buses() replaced by assign_der_units()
+# Now places WT + PV + Biomass exactly as in Wang et al. Table 1
+# (23 DG units total, instead of just 5 PV buses)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def assign_der_units(system: IEEE69BusSystem) -> IEEE69BusSystem:
+    """
+    Assign DG units (Wind Turbine, PV, Biomass) to buses exactly as specified
+    in Wang et al. (2020), Table 1:
+      - 6 Wind Turbines  @ buses [52,43,35,19,16,13], 110 kW each
+      - 6 PV systems     @ buses [62,58,56,50,36,30], 150 kW each
+      - 11 Biomass units @ buses [68,57,54,45,42,38,33,27,21,15,6],
+                            capacities [75,75,75,50,50,50,75,50,25,50,25,75] kW
+
+    Total: 23 DG units, matching the paper's stated count exactly.
+    """
+    bus_map = {b.bus_id: b for b in system.buses}
+
+    # Wind turbines
+    for bid in WT_BUSES:
+        if bid in bus_map:
+            bus_map[bid].der_type = "WT"
+            bus_map[bid].der_capacity_MW = WT_CAPACITY_KW / 1000.0
+            bus_map[bid].bus_type = 2  # treat as generator bus
+
+    # Photovoltaic
+    for bid in PV_BUSES:
+        if bid in bus_map:
+            bus_map[bid].der_type = "PV"
+            bus_map[bid].der_capacity_MW = PV_CAPACITY_KW / 1000.0
+            bus_map[bid].bus_type = 2
+
+    # Biomass (dispatchable, paired with per-bus capacity list)
+    for bid, cap_kw in zip(BM_BUSES, BM_CAPACITY_KW):
+        if bid in bus_map:
+            bus_map[bid].der_type = "BM"
+            bus_map[bid].der_capacity_MW = cap_kw / 1000.0
+            bus_map[bid].bus_type = 2
+
+    n_wt = len(WT_BUSES)
+    n_pv = len(PV_BUSES)
+    n_bm = len(BM_BUSES)
+    print(f"[DataLoader] DG units assigned: {n_wt} WT + {n_pv} PV + {n_bm} BM "
+          f"= {n_wt+n_pv+n_bm} total (Wang et al. Table 1)")
+    print(f"[DataLoader]   WT buses: {WT_BUSES}")
+    print(f"[DataLoader]   PV buses: {PV_BUSES}")
+    print(f"[DataLoader]   BM buses: {BM_BUSES}")
+    return system
+
+
 def assign_pv_buses(system: IEEE69BusSystem,
                     pv_bus_ids: List[int] = None,
-                    scale_factor: float = 4.0) -> IEEE69BusSystem:
+                    scale_factor: float = 1.0) -> IEEE69BusSystem:
     """
-    Assign PV generation to selected buses.
-    Default: buses 11, 21, 33, 49, 62 (spread across feeders).
+    DEPRECATED — kept only for backward compatibility with old scripts.
+    New code should call assign_der_units(system) instead, which places
+    WT + PV + BM exactly per Wang et al. Table 1.
     """
-    if pv_bus_ids is None:
-        # Representative buses across the three main feeders
-        pv_bus_ids = [11, 21, 33, 49, 62]
+    warnings.warn(
+        "assign_pv_buses() is deprecated; use assign_der_units() to match "
+        "Wang et al. (2020) Table 1 DG placement.", DeprecationWarning)
+    return assign_der_units(system)
 
-    for bus in system.buses:
-        if bus.bus_id in pv_bus_ids:
-            # PV capacity = scale_factor × local load (as in paper, 4x)
-            bus.is_pv_bus = True
-            bus.Pv_MW     = bus.Pd_MW * scale_factor
-            bus.bus_type  = 2   # PV → PV bus
 
-    print(f"[DataLoader] PV assigned to buses: {pv_bus_ids}")
-    return system
+def get_microgrid_for_bus(bus_id: int) -> str:
+    """Return the micro-grid name ('MG1'..'MG5') that a bus belongs to."""
+    return BUS_TO_MICROGRID.get(bus_id, "UNASSIGNED")
+
+
+def get_microgrid_summary(system: IEEE69BusSystem) -> Dict[str, dict]:
+    """
+    Summarize each micro-grid: bus count, total load, DG units inside it.
+    Useful for LLM context and for attack-impact analysis per MG.
+    """
+    summary = {}
+    for mg_name, bus_ids in MICROGRID_MAP.items():
+        mg_buses = [b for b in system.buses if b.bus_id in bus_ids]
+        ders = [(b.bus_id, b.der_type, b.der_capacity_MW)
+                for b in mg_buses if b.der_type != "none"]
+        summary[mg_name] = {
+            "n_buses":       len(mg_buses),
+            "bus_ids":       bus_ids,
+            "total_load_MW": sum(b.Pd_MW for b in mg_buses),
+            "der_units":     ders,
+            "total_der_MW":  sum(d[2] for d in ders),
+        }
+    return summary
 
 
 def assign_storage_buses(system: IEEE69BusSystem,
                          storage_bus_ids: List[int] = None,
-                         capacity_MWh: float = 0.5,
-                         power_MW: float = 0.2) -> dict:
+                         capacity_MWh: float = 0.05,
+                         power_MW: float = 0.02) -> dict:
     """
     Assign energy storage parameters to selected buses.
-    Returns storage config dict used by the dispatch model.
+    NOTE: Wang et al. does not model storage explicitly (biomass plays the
+    dispatchable role instead). This remains available for the FDI attack/
+    detection model from Wu et al., which DOES require storage buses.
+    Defaults changed to small values consistent with the new 1 MW base.
     """
     if storage_bus_ids is None:
-        storage_bus_ids = [6, 25, 50]
+        storage_bus_ids = [6, 30, 50]   # overlap with Wang et al. BM/PV buses
 
     storage = {}
     for bid in storage_bus_ids:
@@ -374,9 +464,16 @@ def assign_storage_buses(system: IEEE69BusSystem,
 
 
 if __name__ == "__main__":
-    # Quick test
     sys69 = load_ieee69_from_excel(BUS_EXCEL_PATH)
-    sys69 = assign_pv_buses(sys69)
+    sys69 = assign_der_units(sys69)
     storage = assign_storage_buses(sys69)
+
     print(f"\nY-bus shape: {sys69.Y_bus.shape}")
-    print(f"Sample Y-bus diagonal (bus 1): {sys69.Y_bus[0,0]:.4f}")
+
+    print("\n--- Micro-Grid Summary ---")
+    summary = get_microgrid_summary(sys69)
+    for mg, info in summary.items():
+        print(f"{mg}: {info['n_buses']} buses, "
+              f"load={info['total_load_MW']*1000:.1f} kW, "
+              f"DER={info['total_der_MW']*1000:.1f} kW "
+              f"({len(info['der_units'])} units)")
