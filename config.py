@@ -21,15 +21,42 @@ BUS_DATA_SHEET      = "BusData"       # columns: Bus, Type, Pd(kW), Qd(kVAr), Vb
 BRANCH_DATA_SHEET   = "BranchData"    # columns: From, To, R(ohm), X(ohm), B(S), RatingMVA
 
 # ─── Power System Parameters ──────────────────────────────────────────────────
-S_BASE_MVA      = 10.0      # System base MVA
-V_BASE_KV       = 12.66     # Base voltage kV (IEEE 69-bus standard)
+S_BASE_MVA      = 1.0       # System base MVA
+V_BASE_KV       = 12.0      # Base voltage kV (IEEE 69-bus standard)
 V_MIN_PU        = 0.90      # Minimum voltage (p.u.)
 V_MAX_PU        = 1.05      # Maximum voltage (p.u.)
 FREQ_HZ         = 60.0      # System frequency
 
 # PV penetration scaling (paper uses 4x to reach ~15%)
-PV_SCALE_FACTOR = 4.0
-PV_PENETRATION  = 0.15      # Target solar penetration
+# ─── DG Unit Placement (Wang et al., Energy Reports 2020, Table 1) ───────────
+# 23 DG units total: 6 WT + 6 PV + 11 Biomass, on the standard IEEE 69-bus system
+
+WT_BUSES        = [52, 43, 35, 19, 16, 13]
+WT_CAPACITY_KW  = 110              # per unit
+WT_COST_USD_MWH = 96.8
+
+PV_BUSES        = [62, 58, 56, 50, 36, 30]
+PV_CAPACITY_KW  = 150              # per unit
+PV_COST_USD_MWH = 156.9
+
+BM_BUSES        = [68, 57, 54, 45, 42, 38, 33, 27, 21, 15, 6]
+BM_CAPACITY_KW  = [75, 75, 75, 50, 50, 50, 75, 50, 25, 50, 25, 75]  # per-bus capacity
+BM_COST_USD_MWH = 120.2
+
+# Wind turbine power curve (Wang et al. eq. 2)
+WT_V_CI           = 3.0     # cut-in speed, m/s
+WT_V_R             = 12.0    # rated speed, m/s
+WT_V_CO            = 25.0    # cut-out speed, m/s
+WT_WEIBULL_SHAPE  = 2.0     # beta (shape parameter)
+WT_WEIBULL_SCALE  = 6.0     # alpha (scale parameter, m/s)
+
+# PV radiation model (Wang et al. eq. 3)
+PV_R_STD = 1000.0   # W/m^2 standard environment radiation
+PV_R_C   = 150.0    # W/m^2 threshold radiation
+
+# Keep for backward compatibility with any old code paths
+PV_SCALE_FACTOR = 1.0
+PV_PENETRATION  = 0.15
 
 # ─── Time Settings ────────────────────────────────────────────────────────────
 T_INTERVALS     = 24        # 24 hourly intervals per day
@@ -65,6 +92,19 @@ SECURITY_THRESHOLD_MW = 0.5  # Scaled for 69-bus (paper uses 1MW for 187-bus)
 # ─── Demand / Generation Uncertainty ─────────────────────────────────────────
 DEMAND_NOISE_STD = 0.02     # 2% std Gaussian demand forecast error
 GEN_COST_NOISE_STD  = 0.0   # Perfect info (relaxed in sensitivity analysis)
+
+
+# ─── Micro-Grid Partition (Wang et al., Table 3) ─────────────────────────────
+MICROGRID_MAP = {
+    "MG1": [49, 50, 51, 52, 53, 54],
+    "MG2": [28, 29, 30, 31, 32, 33, 34, 35],
+    "MG3": [18, 19, 20, 21, 22, 23, 24, 25, 26, 27],
+    "MG4": [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 40, 41, 42, 43, 44, 45,
+            46, 47, 48, 55, 56, 57, 58],
+    "MG5": [1, 2, 3, 4, 5, 36, 37, 38, 39, 59, 60, 61, 62, 63, 64, 65, 66, 67,
+            68, 69],
+}
+BUS_TO_MICROGRID = {bus: mg for mg, buses in MICROGRID_MAP.items() for bus in buses}
 
 # ─── CNN Detection Model ──────────────────────────────────────────────────────
 CNN_CONFIG = {
