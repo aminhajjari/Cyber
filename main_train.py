@@ -98,7 +98,7 @@ def main():
 
     # ── System setup ───────────────────────────────────────────────────────
     system  = load_ieee69_from_excel(args.excel)
-    system  = assign_pv_buses(system)
+    system = assign_der_units(system)
     storage = assign_storage_buses(system)
 
     # ── Profiles ───────────────────────────────────────────────────────────
