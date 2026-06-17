@@ -102,8 +102,7 @@ def main():
     storage = assign_storage_buses(system)
 
     # ── Profiles ───────────────────────────────────────────────────────────
-    load_MW, pv_MW, reserve = generate_daily_profiles(system, n_days=args.n_days,
-                                                        seed=args.seed)
+    load_MW, der_gen_MW, reserve, der_breakdown = generate_daily_profiles(system, n_days=args.n_days, seed=args.seed)
 
     # ── Power flow ─────────────────────────────────────────────────────────
     pf_all = run_power_flow_all(system, load_MW, pv_MW)
