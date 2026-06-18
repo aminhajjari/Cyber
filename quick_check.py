@@ -42,13 +42,15 @@ def main():
     except ImportError as e:
         fail(str(e))
 
-    check("Data loader (IEEE 69-bus + WT/PV/BM placement)")
+    check("Data loader (IEEE 69-bus + WT/PV/BM/BESS/EV placement)")
     try:
         from data_loader import (load_ieee69_from_excel, assign_der_units,
-                                  assign_storage_buses, get_microgrid_summary)
-        sys69   = load_ieee69_from_excel(args.excel)
-        sys69   = assign_der_units(sys69)
-        storage = assign_storage_buses(sys69)
+                                  assign_storage_buses, assign_ev_units,
+                                  get_microgrid_summary)
+        sys69    = load_ieee69_from_excel(args.excel)
+        sys69    = assign_der_units(sys69)
+        storage  = assign_storage_buses(sys69)
+        ev_units = assign_ev_units(sys69)
         assert sys69.n_bus == 69, f"Expected 69 buses, got {sys69.n_bus}"
         assert sys69.Y_bus is not None
 
@@ -60,6 +62,16 @@ def main():
         assert n_bm == 11, f"Expected 11 BM buses, got {n_bm}"
         ok(f"{sys69.n_bus} buses | DG: {n_wt} WT + {n_pv} PV + {n_bm} BM "
            f"= {n_wt+n_pv+n_bm} units (expected 23)")
+
+        assert len(storage) == 5, f"Expected 5 BESS units, got {len(storage)}"
+        total_bess_kw = sum(c["power_MW"] for c in storage.values()) * 1000
+        ok(f"BESS: {len(storage)} units, {total_bess_kw:.0f} kW total power "
+           f"[project addition, not from either source paper]")
+
+        assert len(ev_units) == 6, f"Expected 6 EV buses, got {len(ev_units)}"
+        total_ev_fleet = sum(c["n_vehicles"] for c in ev_units.values())
+        ok(f"EV: {len(ev_units)} buses, {total_ev_fleet} vehicles total "
+           f"[project addition, not from either source paper]")
 
         mg_summary = get_microgrid_summary(sys69)
         total_mg_buses = sum(v["n_buses"] for v in mg_summary.values())
@@ -81,27 +93,53 @@ def main():
         assert res.converged, "Power flow did not converge"
         if not (0.9 < res.V_min_pu <= 1.05):
             print(f"  WARNING: V_min={res.V_min_pu:.4f} is outside the ideal "
-                  f"[0.90,1.05] band. Known pre-existing solver accuracy issue, "
-                  f"unrelated to today's Wang et al. changes. Not blocking.")
+                  f"[0.90,1.05] band. This previously happened when using the "
+                  f"hardcoded fallback topology (load_ieee69_standard), which "
+                  f"differs from the user's real Excel file in 5 branches. "
+                  f"If you are passing --excel pointing at the real file, this "
+                  f"should now read ~0.91 and this warning should not appear.")
         ok(f"Converged in {res.n_iter} iter | V_min={res.V_min_pu:.4f} pu "
            f"at bus {res.V_min_bus}")
     except Exception:
         fail(traceback.format_exc())
 
-    check("Daily profile generation (WT Weibull + PV irradiance + BM constant)")
+    check("Daily profile generation (WT+PV+BM generation, EV load)")
     try:
         from power_flow import generate_daily_profiles
         load_MW, der_gen_MW, reserve, breakdown = generate_daily_profiles(
             sys69, n_days=5, seed=42)
         assert load_MW.shape == (5, 24, 69)
         assert der_gen_MW.shape == (5, 24, 69)
-        assert set(breakdown.keys()) == {"WT", "PV", "BM"}
+        assert set(breakdown.keys()) == {"WT", "PV", "BM", "EV"}
         assert np.all(load_MW >= 0) and np.all(der_gen_MW >= 0)
         ok(f"load shape={load_MW.shape} | DER gen shape={der_gen_MW.shape} | "
            f"breakdown keys={list(breakdown.keys())}")
         ok(f"avg WT output={breakdown['WT'].mean()*1000:.3f} kW/bus-hr, "
            f"avg PV output={breakdown['PV'].mean()*1000:.3f} kW/bus-hr, "
-           f"avg BM output={breakdown['BM'].mean()*1000:.3f} kW/bus-hr")
+           f"avg BM output={breakdown['BM'].mean()*1000:.3f} kW/bus-hr, "
+           f"avg EV load={breakdown['EV'].mean()*1000:.3f} kW/bus-hr")
+        # EV load must already be included inside load_MW (additive demand)
+        assert breakdown["EV"].sum() > 0, "EV load is all zero -- not generating"
+    except Exception:
+        fail(traceback.format_exc())
+
+    check("System margin calibration (no false outage before attack window)")
+    try:
+        from attack_model import AttackSimulator
+        from config import ATTACK_START_H, SECURITY_THRESHOLD_MW
+        sim_cal = AttackSimulator(sys69, storage, seed=42)
+        cal_fail_days = 0
+        for d in range(5):
+            r = sim_cal.simulate_day(load_MW[d], der_gen_MW[d], "S1")
+            pre_attack_hours = range(0, ATTACK_START_H)
+            min_pre = min(r.system_margin_true[t] for t in pre_attack_hours)
+            if min_pre < SECURITY_THRESHOLD_MW:
+                cal_fail_days += 1
+        assert cal_fail_days == 0, (
+            f"{cal_fail_days}/5 days show a false 'outage' BEFORE the attack "
+            f"window even starts -- margin calibration bug has regressed.")
+        ok(f"No false pre-attack-window outages across 5 test days "
+           f"(margin calibration bug fix verified)")
     except Exception:
         fail(traceback.format_exc())
 
