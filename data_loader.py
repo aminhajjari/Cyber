@@ -22,6 +22,10 @@ from config import (
     PV_BUSES, PV_CAPACITY_KW, PV_COST_USD_MWH,
     BM_BUSES, BM_CAPACITY_KW, BM_COST_USD_MWH,
     MICROGRID_MAP, BUS_TO_MICROGRID,
+    BESS_BUSES, BESS_POWER_KW, BESS_CAPACITY_KWH,
+    BESS_ETA_CH, BESS_ETA_DIS, BESS_SOC_MIN, BESS_SOC_MAX, BESS_SOC_INIT,
+    EV_BUSES, EV_N_VEHICLES_PER_BUS, EV_CHARGER_KW,
+    EV_CONTROLLABLE_FRACTION, EV_CHARGE_PROB_BY_HOUR,
 )
 
 
@@ -83,11 +87,29 @@ class IEEE69BusSystem:
 
 def load_ieee69_from_excel(excel_path: str) -> IEEE69BusSystem:
     """
-    Load IEEE 69-bus data from Excel file.
+    Load IEEE 69-bus data from the user's Excel file.
 
-    Expected sheets:
-      BusData   : Bus | Type | Pd_kW | Qd_kVAr | Vbase_kV
-      BranchData: From | To | R_ohm | X_ohm | B_S | RatingMVA
+    CHANGED (topology-fidelity fix): this function previously expected a
+    generic "BusData"/"BranchData" sheet layout with kW/ohm units, and
+    silently fell back to load_ieee69_standard() (a DIFFERENT, hardcoded
+    69-bus branch topology) whenever the user's actual file didn't match
+    that layout -- which it never did, since the real uploaded file is a
+    MATPOWER-style case export with sheets named "Bus Data" / "Line data",
+    a few header/comment rows before the real column row, loads already in
+    MW (not kW), and impedances already in PER-UNIT (not ohms).
+
+    We now parse the user's actual file directly. This matters because a
+    direct branch-by-branch comparison showed the previous hardcoded
+    fallback topology (load_ieee69_standard) differs from this file in 5
+    branches -- e.g. bus 36 branches directly off bus 3 in the real data,
+    but the old hardcoded version chained it as 35->36 instead. Using the
+    user's real file here removes that topology-fidelity gap for the base
+    network (DG/BESS/EV bus placements from Wang et al. are layered on top
+    of whichever topology is loaded, and are unaffected by this fix).
+
+    Expected sheet layout (MATPOWER case export):
+      "Bus Data"  : header row contains bus_i, type, Pd, Qd, ... (Pd/Qd in MW/MVAr)
+      "Line data" : header row contains fbus, tbus, r, x, b, ... (r/x in p.u.)
     """
     if not os.path.exists(excel_path):
         warnings.warn(
@@ -99,21 +121,36 @@ def load_ieee69_from_excel(excel_path: str) -> IEEE69BusSystem:
 
     print(f"[DataLoader] Loading IEEE 69-bus from: {excel_path}")
 
-    # ── Bus Data ──────────────────────────────────────────────────────────────
+    def _find_header_row(excel_path, sheet_name, key_col_name, max_scan=6):
+        """Scan the first few rows to find which row holds the real
+        column headers (MATPOWER exports often have comment/blank rows
+        before the actual header)."""
+        raw = pd.read_excel(excel_path, sheet_name=sheet_name, header=None,
+                             nrows=max_scan)
+        for i in range(len(raw)):
+            row_vals = [str(v).strip().lower() for v in raw.iloc[i].tolist()]
+            if key_col_name in row_vals:
+                return i
+        return 0  # fallback: assume first row is header
+
+    # ── Bus Data ──────────────────────────────────────────────────────────
     try:
-        df_bus = pd.read_excel(excel_path, sheet_name=BUS_DATA_SHEET)
-        df_bus.columns = [c.strip().lower() for c in df_bus.columns]
+        bus_sheet_name = None
+        xl = pd.ExcelFile(excel_path)
+        for s in xl.sheet_names:
+            if "bus" in s.lower():
+                bus_sheet_name = s
+                break
+        if bus_sheet_name is None:
+            bus_sheet_name = BUS_DATA_SHEET
+
+        hdr_row = _find_header_row(excel_path, bus_sheet_name, "bus_i")
+        df_bus = pd.read_excel(excel_path, sheet_name=bus_sheet_name, header=hdr_row)
+        df_bus.columns = [str(c).strip().lower() for c in df_bus.columns]
+        df_bus = df_bus[pd.to_numeric(df_bus.iloc[:, 0], errors="coerce").notna()]
     except Exception as e:
         warnings.warn(f"Could not read bus sheet: {e}. Using standard data.")
         return load_ieee69_standard()
-
-    col_map_bus = {
-        "bus":      ["bus", "bus_id", "node", "bus no", "busno"],
-        "type":     ["type", "bus_type", "bustype"],
-        "pd_kw":    ["pd_kw", "pd(kw)", "p_kw", "pd", "pload"],
-        "qd_kvar":  ["qd_kvar", "qd(kvar)", "q_kvar", "qd", "qload"],
-        "vbase_kv": ["vbase_kv", "vbase", "kv", "voltage_kv"],
-    }
 
     def find_col(df, candidates):
         for c in candidates:
@@ -121,56 +158,104 @@ def load_ieee69_from_excel(excel_path: str) -> IEEE69BusSystem:
                 return c
         return None
 
-    bus_col  = find_col(df_bus, col_map_bus["bus"])
-    type_col = find_col(df_bus, col_map_bus["type"])
-    pd_col   = find_col(df_bus, col_map_bus["pd_kw"])
-    qd_col   = find_col(df_bus, col_map_bus["qd_kvar"])
+    col_map_bus = {
+        "bus":  ["bus_i", "bus", "bus_id", "node", "bus no", "busno"],
+        "type": ["type", "bus_type", "bustype"],
+        "pd":   ["pd", "pd_kw", "pd(kw)", "p_kw", "pload"],
+        "qd":   ["qd", "qd_kvar", "qd(kvar)", "q_kvar", "qload"],
+        "basekv": ["basekv", "vbase_kv", "vbase", "kv"],
+    }
+    bus_col   = find_col(df_bus, col_map_bus["bus"])
+    type_col  = find_col(df_bus, col_map_bus["type"])
+    pd_col    = find_col(df_bus, col_map_bus["pd"])
+    qd_col    = find_col(df_bus, col_map_bus["qd"])
+    basekv_col = find_col(df_bus, col_map_bus["basekv"])
+
+    # Unit auto-detection: MATPOWER case files store Pd in MW already.
+    # If pd values look implausibly large for MW (e.g. >50 on average for a
+    # 69-bus feeder), they are probably actually in kW -- guard against
+    # double conversion errors either way.
+    raw_pd_vals = pd.to_numeric(df_bus[pd_col], errors="coerce").fillna(0) if pd_col else None
+    pd_is_kw = False
+    if raw_pd_vals is not None and len(raw_pd_vals) > 0:
+        nonzero = raw_pd_vals[raw_pd_vals > 0]
+        if len(nonzero) > 0 and nonzero.mean() > 50:
+            pd_is_kw = True   # values like 75, 145 etc. with no decimal -> likely kW
 
     buses = []
     for _, row in df_bus.iterrows():
         bus_id   = int(row[bus_col]) if bus_col else int(row.iloc[0])
         bus_type = int(row[type_col]) if type_col else 1
-        Pd_kW    = float(row[pd_col])  if pd_col  else 0.0
-        Qd_kVAr  = float(row[qd_col])  if qd_col  else 0.0
+        Pd_raw   = float(row[pd_col])  if pd_col  else 0.0
+        Qd_raw   = float(row[qd_col])  if qd_col  else 0.0
+        Pd_MW    = Pd_raw / 1000.0 if pd_is_kw else Pd_raw
+        Qd_MVAr  = Qd_raw / 1000.0 if pd_is_kw else Qd_raw
         buses.append(BusData(
             bus_id   = bus_id,
             bus_type = bus_type,
-            Pd_MW    = Pd_kW  / 1000.0,
-            Qd_MVAr  = Qd_kVAr / 1000.0,
+            Pd_MW    = Pd_MW,
+            Qd_MVAr  = Qd_MVAr,
         ))
 
-    # ── Branch Data ───────────────────────────────────────────────────────────
+    base_kv_used = V_BASE_KV
+    if basekv_col is not None:
+        kv_vals = pd.to_numeric(df_bus[basekv_col], errors="coerce").dropna()
+        if len(kv_vals) > 0 and kv_vals.iloc[0] > 0:
+            base_kv_used = float(kv_vals.iloc[0])
+
+    # ── Branch ("Line") Data ─────────────────────────────────────────────
     try:
-        df_br = pd.read_excel(excel_path, sheet_name=BRANCH_DATA_SHEET)
-        df_br.columns = [c.strip().lower() for c in df_br.columns]
+        line_sheet_name = None
+        for s in xl.sheet_names:
+            if "line" in s.lower() or "branch" in s.lower():
+                line_sheet_name = s
+                break
+        if line_sheet_name is None:
+            line_sheet_name = BRANCH_DATA_SHEET
+
+        hdr_row_br = _find_header_row(excel_path, line_sheet_name, "fbus")
+        df_br = pd.read_excel(excel_path, sheet_name=line_sheet_name, header=hdr_row_br)
+        df_br.columns = [str(c).strip().lower() for c in df_br.columns]
+        df_br = df_br[pd.to_numeric(df_br.iloc[:, 0], errors="coerce").notna()]
     except Exception as e:
         warnings.warn(f"Could not read branch sheet: {e}. Using standard data.")
         return load_ieee69_standard()
 
     col_map_br = {
-        "from":    ["from", "from_bus", "fbus", "sending"],
-        "to":      ["to",   "to_bus",   "tbus", "receiving"],
-        "r_ohm":   ["r_ohm", "r(ohm)", "resistance", "r"],
-        "x_ohm":   ["x_ohm", "x(ohm)", "reactance",  "x"],
-        "b_s":     ["b_s",   "b(s)",   "susceptance", "b"],
-        "rating":  ["ratingmva", "rating_mva", "rating", "mva"],
+        "from":   ["fbus", "from", "from_bus", "sending"],
+        "to":     ["tbus", "to",   "to_bus",   "receiving"],
+        "r":      ["r", "r_ohm", "r(ohm)", "resistance"],
+        "x":      ["x", "x_ohm", "x(ohm)", "reactance"],
+        "b":      ["b", "b_s", "b(s)", "susceptance"],
+        "rating": ["ratea", "ratingmva", "rating_mva", "rating", "mva"],
     }
+    from_col = find_col(df_br, col_map_br["from"])
+    to_col   = find_col(df_br, col_map_br["to"])
+    r_col    = find_col(df_br, col_map_br["r"])
+    x_col    = find_col(df_br, col_map_br["x"])
+    b_col    = find_col(df_br, col_map_br["b"])
+    rate_col = find_col(df_br, col_map_br["rating"])
 
-    from_col   = find_col(df_br, col_map_br["from"])
-    to_col     = find_col(df_br, col_map_br["to"])
-    r_col      = find_col(df_br, col_map_br["r_ohm"])
-    x_col      = find_col(df_br, col_map_br["x_ohm"])
-    b_col      = find_col(df_br, col_map_br["b_s"])
-    rate_col   = find_col(df_br, col_map_br["rating"])
+    Z_base = (base_kv_used ** 2) / S_BASE_MVA   # ohms
 
-    Z_base = (V_BASE_KV ** 2) / S_BASE_MVA   # ohms
+    # Unit auto-detection for r/x: MATPOWER case files store these already
+    # in per-unit (e.g. 0.0000310 for the first 69-bus feeder segment).
+    # Values that small can ONLY be p.u. -- raw ohms for a 12.66kV feeder
+    # segment are always >> 0.001. If avg |r| < 0.01 -> already p.u.
+    r_is_pu = True
+    if r_col is not None:
+        r_vals = pd.to_numeric(df_br[r_col], errors="coerce").dropna()
+        if len(r_vals) > 0 and r_vals.abs().mean() > 0.05:
+            r_is_pu = False   # values like 0.3, 1.7 etc -> likely ohms
 
     branches = []
     for _, row in df_br.iterrows():
-        R_pu = float(row[r_col]) / Z_base if r_col else 0.01
-        X_pu = float(row[x_col]) / Z_base if x_col else 0.01
-        B_pu = float(row[b_col]) * Z_base  if b_col else 0.0
-        rating = float(row[rate_col]) if rate_col else S_BASE_MVA
+        r_raw = float(row[r_col]) if r_col else 0.0001
+        x_raw = float(row[x_col]) if x_col else 0.0001
+        R_pu = r_raw if r_is_pu else r_raw / Z_base
+        X_pu = x_raw if r_is_pu else x_raw / Z_base
+        B_pu = float(row[b_col]) if b_col else 0.0
+        rating = float(row[rate_col]) if (rate_col and not pd.isna(row[rate_col]) and row[rate_col] != 0) else S_BASE_MVA
         branches.append(BranchData(
             from_bus   = int(row[from_col]) if from_col else int(row.iloc[0]),
             to_bus     = int(row[to_col])   if to_col   else int(row.iloc[1]),
@@ -187,9 +272,11 @@ def load_ieee69_from_excel(excel_path: str) -> IEEE69BusSystem:
     system.Z_base = Z_base
     _build_ybus(system)
 
-    print(f"[DataLoader] Loaded {system.n_bus} buses, {system.n_branch} branches")
-    print(f"[DataLoader] Total load: {system.total_load_MW:.3f} MW, "
-          f"{system.total_load_MVAr:.3f} MVAr")
+    print(f"[DataLoader] Loaded {system.n_bus} buses, {system.n_branch} branches "
+          f"from user's Excel file (sheets: '{bus_sheet_name}', '{line_sheet_name}')")
+    print(f"[DataLoader] Total load: {system.total_load_MW:.4f} MW, "
+          f"{system.total_load_MVAr:.4f} MVAr | base_kV={base_kv_used} | "
+          f"r/x units detected as: {'p.u.' if r_is_pu else 'ohms'}")
     return system
 
 
@@ -436,37 +523,109 @@ def get_microgrid_summary(system: IEEE69BusSystem) -> Dict[str, dict]:
 
 def assign_storage_buses(system: IEEE69BusSystem,
                          storage_bus_ids: List[int] = None,
-                         capacity_MWh: float = 0.05,
-                         power_MW: float = 0.02) -> dict:
+                         capacity_MWh: float = None,
+                         power_MW: float = None) -> dict:
     """
-    Assign energy storage parameters to selected buses.
-    NOTE: Wang et al. does not model storage explicitly (biomass plays the
-    dispatchable role instead). This remains available for the FDI attack/
-    detection model from Wu et al., which DOES require storage buses.
-    Defaults changed to small values consistent with the new 1 MW base.
+    Assign Battery Energy Storage System (BESS) units to specific buses.
+
+    CHANGED: previously this used arbitrary placeholder buses [6, 25, 50]
+    with a single uniform size for all units. Neither source paper specifies
+    a BESS model (Wang et al. has no storage at all; Wu et al. references
+    "storage" generically without siting it). This is now a deliberately
+    designed addition: one BESS per micro-grid (Wang et al. Table 3),
+    sited at each MG's largest DG-hosting bus, sized to ~2h of that MG's
+    DER capacity (see config.py BESS_* block for the documented rationale).
+
+    If storage_bus_ids/capacity_MWh/power_MW are explicitly passed, they
+    override the config.py defaults (kept for flexibility/backward compat),
+    otherwise the Wang-et-al-aligned per-MG siting in config.py is used.
     """
     if storage_bus_ids is None:
-        storage_bus_ids = [6, 30, 50]   # overlap with Wang et al. BM/PV buses
+        storage_bus_ids = BESS_BUSES
+        power_list = [p/1000.0 for p in BESS_POWER_KW]
+        cap_list   = [c/1000.0 for c in BESS_CAPACITY_KWH]
+    else:
+        # Caller supplied a custom bus list -> use uniform fallback sizing
+        power_list = [power_MW or 0.02] * len(storage_bus_ids)
+        cap_list   = [capacity_MWh or 0.05] * len(storage_bus_ids)
 
+    bus_map = {b.bus_id: b for b in system.buses}
     storage = {}
-    for bid in storage_bus_ids:
+    for bid, p_mw, e_mwh in zip(storage_bus_ids, power_list, cap_list):
         storage[bid] = {
-            "capacity_MWh": capacity_MWh,
-            "power_MW":     power_MW,
-            "soc_min":      0.10,
-            "soc_max":      0.90,
-            "eta_ch":       0.95,
-            "eta_dis":      0.95,
-            "soc_init":     0.50,
+            "capacity_MWh": e_mwh,
+            "power_MW":     p_mw,
+            "soc_min":      BESS_SOC_MIN,
+            "soc_max":      BESS_SOC_MAX,
+            "eta_ch":       BESS_ETA_CH,
+            "eta_dis":      BESS_ETA_DIS,
+            "soc_init":     BESS_SOC_INIT,
         }
-    print(f"[DataLoader] Storage at buses: {storage_bus_ids}")
+        # Tag the bus so DER-type reporting / LLM context can see it
+        if bid in bus_map and bus_map[bid].der_type == "none":
+            bus_map[bid].der_type = "BESS_host"   # informational only;
+            # NOTE: BESS is NOT counted as a generation DER (it's net-zero
+            # over a cycle), so der_capacity_MW is intentionally left at 0
+            # here to avoid double counting it in DG totals/Table-1 counts.
+
+    print(f"[DataLoader] BESS units assigned: {len(storage)} units at "
+          f"buses {storage_bus_ids} (total power="
+          f"{sum(power_list)*1000:.0f} kW, total capacity="
+          f"{sum(cap_list)*1000:.0f} kWh) [project addition, see config.py]")
     return storage
+
+
+def assign_ev_units(system: IEEE69BusSystem) -> Dict[int, dict]:
+    """
+    Assign Electric Vehicle (EV) charging load to selected buses.
+
+    NEW — project addition. Neither Wu et al. nor Wang et al. models EVs.
+    EV charging is represented as a controllable, time-varying ADDITIVE
+    load (it stacks on top of the bus's existing Pd_MW from the base case),
+    with a per-bus fleet size and a per-vehicle charger rating. A fraction
+    of this load (EV_CONTROLLABLE_FRACTION) is flagged as demand-response
+    capable, making it a natural extension target for an S2-style (load
+    curtailment) FDI attack alongside the existing curtailable loads.
+
+    Returns
+    -------
+    dict[bus_id] -> {
+        "n_vehicles": int,
+        "charger_kw": float,
+        "max_load_MW": float,          # n_vehicles * charger_kw, if all charge at once
+        "controllable_fraction": float,
+    }
+    """
+    ev_config = {}
+    bus_map = {b.bus_id: b for b in system.buses}
+
+    for bid, n_veh in zip(EV_BUSES, EV_N_VEHICLES_PER_BUS):
+        max_load_MW = (n_veh * EV_CHARGER_KW) / 1000.0
+        ev_config[bid] = {
+            "n_vehicles":   n_veh,
+            "charger_kw":   EV_CHARGER_KW,
+            "max_load_MW":  max_load_MW,
+            "controllable_fraction": EV_CONTROLLABLE_FRACTION,
+        }
+        if bid in bus_map:
+            # Mark informationally; EV load is a DEMAND not a DG, so it does
+            # not change der_type/der_capacity_MW (those remain reserved for
+            # generation-side DG units per Wang et al. Table 1).
+            pass
+
+    total_ev_MW = sum(c["max_load_MW"] for c in ev_config.values())
+    print(f"[DataLoader] EV charging assigned: {len(ev_config)} buses, "
+          f"{sum(EV_N_VEHICLES_PER_BUS)} vehicles total, "
+          f"max simultaneous load={total_ev_MW*1000:.1f} kW "
+          f"[project addition, see config.py]")
+    return ev_config
 
 
 if __name__ == "__main__":
     sys69 = load_ieee69_from_excel(BUS_EXCEL_PATH)
     sys69 = assign_der_units(sys69)
     storage = assign_storage_buses(sys69)
+    ev_units = assign_ev_units(sys69)
 
     print(f"\nY-bus shape: {sys69.Y_bus.shape}")
 
@@ -477,3 +636,14 @@ if __name__ == "__main__":
               f"load={info['total_load_MW']*1000:.1f} kW, "
               f"DER={info['total_der_MW']*1000:.1f} kW "
               f"({len(info['der_units'])} units)")
+
+    print("\n--- BESS Summary ---")
+    for bid, cfg in storage.items():
+        print(f"  Bus {bid}: {cfg['power_MW']*1000:.0f} kW / "
+              f"{cfg['capacity_MWh']*1000:.0f} kWh")
+
+    print("\n--- EV Summary ---")
+    for bid, cfg in ev_units.items():
+        print(f"  Bus {bid}: {cfg['n_vehicles']} vehicles, "
+              f"max load {cfg['max_load_MW']*1000:.1f} kW "
+              f"({cfg['controllable_fraction']*100:.0f}% controllable)")
