@@ -19,7 +19,7 @@ from config import (
     S_BASE_MVA, T_INTERVALS, ATTACK_START_H, ATTACK_END_H,
     ATTACK_MAGNITUDE, EPSILON_ATTACK, RHO_SMOOTH,
     RESERVE_FRACTION, SECURITY_THRESHOLD_MW, RANDOM_SEED,
-    BUS_TO_MICROGRID,
+    BUS_TO_MICROGRID, SLACK_CAPACITY_MW,
 )
 
 
@@ -110,8 +110,20 @@ class DispatchPredictor:
             total_load = load_MW[t].sum()
             residual = max(0, total_load - der_total)
 
-            # Slack bus covers residual + reserve
-            gen_dispatch[t, 0] = residual + reserve_MW[t]
+            # FIX: slack bus covers ONLY the residual load it needs to serve.
+            # Previously this line was `residual + reserve_MW[t]`, which
+            # baked the required reserve directly into the dispatch target,
+            # making true system margin (= gen - load - reserve) collapse to
+            # ~0 MW EVERY hour by construction (only floating point noise
+            # around zero) -- so any nonzero SECURITY_THRESHOLD_MW would
+            # trigger a false "outage" at hour 0, before the attack window
+            # even starts. Reserve is now genuine UNUSED capacity: the
+            # substation/slack has a fixed import limit (SLACK_CAPACITY_MW,
+            # representing the upstream transmission interconnection), and
+            # margin = how much of that capacity remains unused. This
+            # matches Wu et al.'s definition of system margin as "remaining
+            # operational reserve," not "deviation from an exact target."
+            gen_dispatch[t, 0] = residual
 
             if rng is not None and self.noise_std > 0:
                 noise = rng.normal(0, self.noise_std, n)
@@ -292,14 +304,26 @@ class AttackSimulator:
         monitored_margin = np.zeros(T)
         outage_time = None
         for t in range(T):
-            true_gen   = falsified_gen[t].sum()  + stor_disp[t].sum()
+            # FIX: system margin = remaining UNUSED slack/substation import
+            # capacity, not "gen - load - reserve" (which was tautologically
+            # ~0 by construction of the old dispatch formula). The slack bus
+            # was dispatched to cover only the (pre-attack) residual load;
+            # under attack, falsified generation/curtailment changes how
+            # much the slack would ACTUALLY need to supply to keep the
+            # system balanced. We recompute that required slack draw here
+            # and compare it against the fixed substation capacity.
+            non_slack_gen_true = (falsified_gen[t, 1:].sum()
+                                   + stor_disp[t, 1:].sum())
             true_load  = load_MW[t].sum() - falsified_curt[t].sum()
+            required_slack_true = max(0.0, true_load - non_slack_gen_true)
             true_resv  = reserve_MW[t]
-            true_margin[t] = true_gen - true_load - true_resv
+            true_margin[t] = SLACK_CAPACITY_MW - required_slack_true - true_resv
 
-            mon_gen  = gen_disp[t].sum() + stor_disp[t].sum()
+            non_slack_gen_mon = (gen_disp[t, 1:].sum()
+                                  + stor_disp[t, 1:].sum())
             mon_load = load_MW[t].sum() - curtail[t].sum()
-            monitored_margin[t] = mon_gen - mon_load - true_resv
+            required_slack_mon = max(0.0, mon_load - non_slack_gen_mon)
+            monitored_margin[t] = SLACK_CAPACITY_MW - required_slack_mon - true_resv
 
             if outage_time is None and true_margin[t] < SECURITY_THRESHOLD_MW:
                 outage_time = t
