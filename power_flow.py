@@ -16,7 +16,9 @@ from collections import deque
 from data_loader import IEEE69BusSystem, BranchData
 from config import (V_BASE_KV, S_BASE_MVA, V_MIN_PU, V_MAX_PU,
                     WT_V_CI, WT_V_R, WT_V_CO, WT_WEIBULL_SHAPE, WT_WEIBULL_SCALE,
-                    PV_R_STD, PV_R_C)
+                    PV_R_STD, PV_R_C,
+                    EV_BUSES, EV_N_VEHICLES_PER_BUS, EV_CHARGER_KW,
+                    EV_CHARGE_PROB_BY_HOUR)
 
 
 @dataclass
@@ -195,24 +197,41 @@ def pv_power(R: np.ndarray, p_rs_MW: float,
     return P
 
 
+def ev_charging_load(rng: np.random.Generator, n_vehicles: int,
+                      charger_kw: float, charge_prob: float) -> float:
+    """
+    NEW — project addition. Sample aggregate EV charging load (MW) at one
+    bus for one hour, given a fleet size and the probability that any given
+    vehicle is actively charging at this hour (EV_CHARGE_PROB_BY_HOUR).
+    Each vehicle's charging decision is drawn independently (binomial), so
+    the aggregate naturally smooths for larger fleets while staying noisy
+    for small ones — a simple but standard way to represent uncoordinated
+    EV charging behavior at the feeder level.
+    """
+    n_charging = rng.binomial(n_vehicles, charge_prob)
+    return (n_charging * charger_kw) / 1000.0   # MW
+
+
 def generate_daily_profiles(system: IEEE69BusSystem,
                              n_days=356, seed=42, noise_std=0.02):
     """
     Generate synthetic daily load and DG generation profiles.
 
-    CHANGED: now generates separate WT (Weibull wind + power curve),
-    PV (radiation-based), and BM (constant dispatchable) output per bus,
-    instead of only PV. Returns combined `pv_MW` (renamed conceptually to
-    "DER output") for backward compatibility with the rest of the pipeline,
-    plus a breakdown dict for diagnostics / LLM context.
+    Generates separate WT (Weibull wind + power curve), PV (radiation-based),
+    and BM (constant dispatchable) generation per bus, PLUS (NEW) electric
+    vehicle (EV) charging load per bus as an additive demand component.
+    EV load is added on top of `load_MW` (so EVs increase demand, they are
+    not a generation source) and is also returned separately in `breakdown`
+    so it can be inspected, plotted, or targeted by an attack model.
 
     Returns
     -------
-    load_MW    : (n_days, T, n_bus)  hourly load at each bus
+    load_MW    : (n_days, T, n_bus)  hourly load at each bus (BASE + EV)
     gen_MW     : (n_days, T, n_bus)  hourly TOTAL DER output (WT+PV+BM) at each bus
-                  (kept as `pv_MW` name in call sites for backward compat)
     reserve    : (n_days, T)         system reserve each hour
-    breakdown  : dict with 'WT', 'PV', 'BM' -> (n_days, T, n_bus) arrays
+    breakdown  : dict with 'WT', 'PV', 'BM', 'EV' -> (n_days, T, n_bus) arrays
+                 ('EV' is a LOAD addition, included in load_MW; 'WT'/'PV'/'BM'
+                 are GENERATION, included in gen_MW)
     """
     rng = np.random.default_rng(seed)
     T, n = 24, system.n_bus
@@ -237,7 +256,11 @@ def generate_daily_profiles(system: IEEE69BusSystem,
     pv_buses = {b.bus_id-1: b.der_capacity_MW for b in system.buses if b.der_type == "PV"}
     bm_buses = {b.bus_id-1: b.der_capacity_MW for b in system.buses if b.der_type == "BM"}
 
-    load_MW   = np.zeros((n_days, T, n))
+    # NEW: EV bus/fleet lookup, 0-indexed
+    ev_buses = {bid-1: n_veh for bid, n_veh in zip(EV_BUSES, EV_N_VEHICLES_PER_BUS)}
+
+    load_base_MW = np.zeros((n_days, T, n))   # base load WITHOUT EVs
+    ev_out_MW    = np.zeros((n_days, T, n))   # NEW: EV charging load
     wt_out_MW = np.zeros((n_days, T, n))
     pv_out_MW = np.zeros((n_days, T, n))
     bm_out_MW = np.zeros((n_days, T, n))
@@ -249,10 +272,16 @@ def generate_daily_profiles(system: IEEE69BusSystem,
         irr_day_scale = rng.uniform(0.3, 0.6) if is_cloudy else rng.uniform(0.7, 1.0)
 
         for t in range(T):
-            # ── Load ──────────────────────────────────────────────────────
+            # ── Base load ─────────────────────────────────────────────────
             noise = rng.normal(0, noise_std, n)
-            load_MW[day,t,:] = np.maximum(
+            load_base_MW[day,t,:] = np.maximum(
                 0, bus_loads * base_load_shape[t] * day_scale * (1+noise))
+
+            # ── EV charging load (NEW) ───────────────────────────────────
+            charge_prob_t = EV_CHARGE_PROB_BY_HOUR[t]
+            for bidx, n_veh in ev_buses.items():
+                ev_out_MW[day, t, bidx] = ev_charging_load(
+                    rng, n_veh, EV_CHARGER_KW, charge_prob_t)
 
             # ── Wind turbines (Weibull speed -> power curve) ───────────────
             for bidx, p_rated in wt_buses.items():
@@ -271,9 +300,11 @@ def generate_daily_profiles(system: IEEE69BusSystem,
             for bidx, p_bm in bm_buses.items():
                 bm_out_MW[day, t, bidx] = p_bm * (1 + rng.normal(0, 0.01))
 
-            reserve[day,t] = load_MW[day,t,:].sum() * 0.05
+            total_load_t = load_base_MW[day,t,:].sum() + ev_out_MW[day,t,:].sum()
+            reserve[day,t] = total_load_t * 0.05
 
-    gen_MW = wt_out_MW + pv_out_MW + bm_out_MW   # combined DER output
+    load_MW = load_base_MW + ev_out_MW   # EVs are additive demand
+    gen_MW  = wt_out_MW + pv_out_MW + bm_out_MW   # combined DER generation
 
     print(f"[PowerFlow] Generated {n_days} days x {T}h profiles for {n} buses")
     print(f"[PowerFlow]   WT capacity: {sum(wt_buses.values())*1000:.0f} kW "
@@ -282,6 +313,9 @@ def generate_daily_profiles(system: IEEE69BusSystem,
           f"across {len(pv_buses)} buses")
     print(f"[PowerFlow]   BM capacity: {sum(bm_buses.values())*1000:.0f} kW "
           f"across {len(bm_buses)} buses")
+    print(f"[PowerFlow]   EV peak load: {ev_out_MW.max()*1000:.1f} kW, "
+          f"avg load: {ev_out_MW.mean()*1000:.2f} kW/bus-hr "
+          f"across {len(ev_buses)} buses [project addition]")
 
-    breakdown = {"WT": wt_out_MW, "PV": pv_out_MW, "BM": bm_out_MW}
+    breakdown = {"WT": wt_out_MW, "PV": pv_out_MW, "BM": bm_out_MW, "EV": ev_out_MW}
     return load_MW, gen_MW, reserve, breakdown
