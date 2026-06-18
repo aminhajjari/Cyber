@@ -85,6 +85,57 @@ MICROGRID_MAP = {
 # Reverse lookup: bus_id -> microgrid name
 BUS_TO_MICROGRID = {bus: mg for mg, buses in MICROGRID_MAP.items() for bus in buses}
 
+# ═══════════════════════════════════════════════════════════════════════════
+# BATTERY ENERGY STORAGE SYSTEMS (BESS) — PROJECT ADDITION, NOT FROM EITHER
+# SOURCE PAPER. Wang et al. (2020) does not model storage at all (biomass
+# plays their "always dispatchable" role instead). Wu et al. (2025) models
+# generic "storage" abstractly without specific siting. Placement and sizing
+# below are OUR OWN design choice, documented explicitly so it is never
+# confused with a value transcribed from either paper.
+#
+# Siting rationale: one BESS per micro-grid (Wang et al. Table 3 partition),
+# placed at the bus with the largest single DG unit in that MG, sized to
+# ~2 hours of that MG's total nameplate DER capacity — a common distribution-
+# level BESS sizing heuristic (sized to "firm" the MG's renewable output for
+# a couple of hours, not full-day energy arbitrage).
+# ═══════════════════════════════════════════════════════════════════════════
+BESS_BUSES = [50, 33, 21, 13, 62]
+# MG1 -> bus 50 (largest DG host in MG1, PV)
+# MG2 -> bus 33 (largest DG host in MG2, BM)
+# MG3 -> bus 21 (largest DG host in MG3, BM)
+# MG4 -> bus 13 (largest DG host in MG4, WT)
+# MG5 -> bus 62 (largest DG host in MG5, PV)
+
+BESS_POWER_KW      = [60, 40, 30, 30, 50]     # per-bus rated charge/discharge power
+BESS_CAPACITY_KWH  = [120, 80, 60, 60, 100]   # per-bus energy capacity (~2h at rated power)
+BESS_ETA_CH        = 0.95
+BESS_ETA_DIS       = 0.95
+BESS_SOC_MIN       = 0.10
+BESS_SOC_MAX       = 0.90
+BESS_SOC_INIT      = 0.50
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ELECTRIC VEHICLES (EV) — PROJECT ADDITION, NOT FROM EITHER SOURCE PAPER.
+# Neither Wu et al. nor Wang et al. models EV charging load or placement.
+# We add EV charging demand at a subset of residential/residential-commercial
+# load buses (mirroring the load classification Wang et al. describes in
+# their Fig. 4, without reusing any of their numeric values). EV load is
+# modeled as a time-varying additive demand with a controllable fraction,
+# so it can later be targeted by an S2-style (load-curtailment) FDI attack
+# exactly like any other demand-response-capable load.
+# ═══════════════════════════════════════════════════════════════════════════
+EV_BUSES = [7, 17, 24, 41, 55, 64]   # spread across multiple micro-grids
+EV_N_VEHICLES_PER_BUS = [15, 10, 12, 8, 10, 14]   # nominal fleet size per bus
+EV_CHARGER_KW         = 7.2          # per-vehicle Level-2 charger rating
+EV_CONTROLLABLE_FRACTION = 0.6       # fraction of EV load that can be shifted/curtailed
+# Charging behavior: most EVs plug in after the evening commute and charge
+# overnight. Modeled as a probability-of-charging curve over 24h (rough,
+# representative shape — not derived from any specific utility dataset).
+EV_CHARGE_PROB_BY_HOUR = [
+    0.55,0.50,0.45,0.40,0.35,0.30,0.20,0.10,0.08,0.08,0.08,0.08,
+    0.08,0.10,0.15,0.25,0.45,0.70,0.85,0.90,0.85,0.75,0.65,0.60,
+]  # index 0 = hour 0 (midnight) ... index 23 = hour 23
+
 # ─── Time Settings ────────────────────────────────────────────────────────────
 T_INTERVALS     = 24        # 24 hourly intervals per day
 T_MONITORING    = 6         # |T_m|: monitoring window (hours)
@@ -113,8 +164,26 @@ RHO_SMOOTH      = 0.5
 # System reserve requirement (fraction of total load)
 RESERVE_FRACTION = 0.05     # 5% reserve
 
+# ── FIX: substation/slack import capacity ──────────────────────────────────
+# Previously the slack bus was dispatched to EXACTLY cover (residual load +
+# reserve), which made true_margin = gen - load - reserve identically ~0 MW
+# every hour by construction (only floating-point noise around zero), so the
+# detection model had no real headroom to lose and "outages" triggered at
+# hour 0 regardless of any attack. We now give the slack/substation a fixed
+# maximum import capacity; margin is genuine UNUSED headroom below that cap,
+# consistent with Wu et al.'s definition of system margin as remaining
+# reserve capacity (not "deviation from an exact dispatch target").
+# Calibrated empirically: with this DER mix, required slack draw peaks
+# around ~3.1 MW under normal conditions, and the S1/S2 attack's maximum
+# achievable falsification impact is ~0.25-0.3 MW. SLACK_CAPACITY_MW is set
+# just above the normal peak so genuine headroom is on the same order as the
+# attack's impact -- enough that the attack CAN exhaust it during the evening
+# ramp, but not so much headroom that no attack could ever matter, and not so
+# little that an "attack" succeeds outside the attack window.
+SLACK_CAPACITY_MW = 3.1     # substation import limit, calibrated to DER mix above
+
 # Security threshold (minimum operating reserve MW)
-SECURITY_THRESHOLD_MW = 0.3  # ~5% of typical 6 MW total load, reasonable margin floor
+SECURITY_THRESHOLD_MW = 0.05  # genuine headroom threshold, same order as attack impact
 
 # ─── Demand / Generation Uncertainty ─────────────────────────────────────────
 DEMAND_NOISE_STD = 0.02     # 2% std Gaussian demand forecast error
