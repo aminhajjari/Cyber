@@ -171,7 +171,7 @@ def main():
             cnn = DetectionModelTrainer("CNN", n_bus, d, cfg)
             cnn.fit(X_tr, y_tr, X_v, y_v)
             cnn.save(cnn_path)
-        metrics["CNN"] = cnn.evaluate(X_te, y_te, f"CNN/{scen}")
+        metrics["CNN"] = cnn.evaluate(X_te, y_te, f"CNN/{scen}", lbl_true=lbl_te)
 
         mlp_path = os.path.join(MODEL_DIR, f"mlp_{scen}.pkl")
         if args.skip_train and os.path.exists(mlp_path):
@@ -180,11 +180,11 @@ def main():
             mlp = DetectionModelTrainer("MLP", n_bus, d, cfg)
             mlp.fit(X_tr, y_tr, X_v, y_v)
             mlp.save(mlp_path)
-        metrics["MLP"] = mlp.evaluate(X_te, y_te, f"MLP/{scen}")
+        metrics["MLP"] = mlp.evaluate(X_te, y_te, f"MLP/{scen}", lbl_true=lbl_te)
 
         svr = SVRDetector()
         svr.fit(X_tr, y_tr)
-        metrics["SVR"] = svr.evaluate(X_te, y_te, f"SVR/{scen}")
+        metrics["SVR"] = svr.evaluate(X_te, y_te, f"SVR/{scen}", lbl_true=lbl_te)
 
         print_table(metrics, scen)
 
