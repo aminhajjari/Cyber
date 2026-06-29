@@ -101,6 +101,8 @@ def build_dataset(attack_results:  list,
     def _add_samples(results, pf_results, is_attack: bool):
         for idx, (res, pf_day) in enumerate(zip(results, pf_results)):
             T = len(res.system_margin_true)
+            # Which hours have active falsification injected?
+            fs = getattr(res, "falsification_signal", None)
             for t_pred in range(T_m + T_PRED_AHEAD, T):
                 x = build_input_tensor(
                     gen_dispatch_hat  = res.original_dispatch,
@@ -121,13 +123,29 @@ def build_dataset(attack_results:  list,
                 X_list.append(x)
                 y_list.append(res.system_margin_true[t_pred])
 
+                # LABEL = 1 if this is an attacked day AND the monitoring
+                # window [t_pred - T_PRED_AHEAD - T_m, t_pred - T_PRED_AHEAD]
+                # contains any active falsification. This detects the PRESENCE
+                # of the attack, not just the eventual outage -> avoids the
+                # extreme class imbalance that made TPR collapse.
+                lbl = 0
+                if is_attack and fs is not None:
+                    w_start = max(0, t_pred - T_PRED_AHEAD - T_m)
+                    w_end   = max(0, t_pred - T_PRED_AHEAD)
+                    if np.abs(fs[w_start:w_end]).sum() > 1e-6:
+                        lbl = 1
+                lbl_list.append(lbl)
+
     _add_samples(attack_results, pf_results_atk,  is_attack=True)
     _add_samples(normal_results, pf_results_norm,  is_attack=False)
 
-    X = np.stack(X_list).astype(np.float32)
-    y = np.array(y_list, dtype=np.float32)
-    print(f"[Dataset] Built {X.shape[0]} samples, X shape: {X.shape}")
-    return X, y
+    X   = np.stack(X_list).astype(np.float32)
+    y   = np.array(y_list,   dtype=np.float32)
+    lbl = np.array(lbl_list, dtype=np.int64)
+    n_pos = int(lbl.sum())
+    print(f"[Dataset] Built {X.shape[0]} samples, X shape: {X.shape} | "
+          f"positives (attacked)={n_pos} ({100*n_pos/len(lbl):.1f}%)")
+    return X, y, lbl
 
 
 # ─────────────────────────────────────────────────────────────────────────────
