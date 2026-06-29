@@ -148,16 +148,17 @@ def main():
             system, storage, load_MW, der_gen_MW, scen, args.seed,
             target_der_type=args.target_der)
 
-        X, y = build_dataset(atk_r, norm_r, pf_all, pf_all,
+        X, y, lbl = build_dataset(atk_r, norm_r, pf_all, pf_all,
                                T_m=T_MONITORING, feature_set="full")
         rng  = np.random.default_rng(args.seed)
         idx  = rng.permutation(len(X))
-        X, y = X[idx], y[idx]
+        X, y, lbl = X[idx], y[idx], lbl[idx]
         n    = len(X)
         n1, n2 = int(.70*n), int(.85*n)
         X_tr,y_tr = X[:n1], y[:n1]
         X_v, y_v  = X[n1:n2], y[n1:n2]
         X_te,y_te = X[n2:], y[n2:]
+        lbl_te    = lbl[n2:]
 
         n_bus, d = X_tr.shape[1], X_tr.shape[2]
         cfg = {**CNN_CONFIG, "epochs": args.epochs}
