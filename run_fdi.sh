@@ -24,7 +24,7 @@ PROJECT_DIR="/home/gkianfar/scratch/Amin/CB/Cyber"
 cd $PROJECT_DIR
 
 # logs go inside Cyber/ ; results & models stay in the parent CB/ (per config.py)
-mkdir -p logs
+mkdir -p /home/gkianfar/scratch/Amin/CB/results/logs
 mkdir -p /home/gkianfar/scratch/Amin/CB/results
 mkdir -p /home/gkianfar/scratch/Amin/CB/models
 
