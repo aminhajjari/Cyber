@@ -473,11 +473,22 @@ class SVRDetector:
         return self.scaler_y.inverse_transform(
             self.svr.predict(X_n).reshape(-1,1)).ravel()
 
-    def evaluate(self, X, y_true, label="test") -> Dict:
+    def evaluate(self, X, y_true, label="test", lbl_true=None) -> Dict:
         y_pred = self.predict(X)
         mse    = float(mean_squared_error(y_true, y_pred))
-        y_tc   = (y_true < SECURITY_THRESHOLD_MW).astype(int)
-        y_pc   = (y_pred < SECURITY_THRESHOLD_MW).astype(int)
+        if lbl_true is not None:
+            nrm_mask = lbl_true == 0
+            if nrm_mask.any():
+                mu  = float(np.mean(y_pred[nrm_mask]))
+                sig = float(np.std(y_pred[nrm_mask]) + 1e-9)
+                cutoff = mu - 1.0 * sig
+            else:
+                cutoff = SECURITY_THRESHOLD_MW
+            y_tc = lbl_true.astype(int)
+            y_pc = (y_pred < cutoff).astype(int)
+        else:
+            y_tc = (y_true < SECURITY_THRESHOLD_MW).astype(int)
+            y_pc = (y_pred < SECURITY_THRESHOLD_MW).astype(int)
         TP = int(((y_tc==1)&(y_pc==1)).sum())
         TN = int(((y_tc==0)&(y_pc==0)).sum())
         FP = int(((y_tc==0)&(y_pc==1)).sum())
