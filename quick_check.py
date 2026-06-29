@@ -187,7 +187,7 @@ def main():
         atk_r  = [sim.simulate_day(load_MW[d], der_gen_MW[d], "S1") for d in range(5)]
         norm_r = [sim.simulate_day(load_MW[d], der_gen_MW[d], "S1") for d in range(5)]
 
-        X, y = build_dataset(atk_r, norm_r, pf_all, pf_all, T_m=6)
+        X, y, lbl = build_dataset(atk_r, norm_r, pf_all, pf_all, T_m=6)
         assert X.ndim == 3 and y.ndim == 1
         ok(f"X.shape={X.shape} | y.shape={y.shape} | "
            f"y range=[{y.min():.4f}, {y.max():.4f}]")
