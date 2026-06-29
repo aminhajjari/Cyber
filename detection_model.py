@@ -85,15 +85,19 @@ def build_dataset(attack_results:  list,
                   pf_results_norm: list,
                   T_m: int = T_MONITORING,
                   feature_set: str = "full"
-                  ) -> Tuple[np.ndarray, np.ndarray]:
+                  ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Build (X, y) dataset from attack and normal simulation results.
+    Build (X, y, lbl) dataset from attack and normal simulation results.
 
-    X : (N_samples, n_bus, d)   — input tensor
-    y : (N_samples,)            — system margin at T_pred (regression target)
+    X   : (N_samples, n_bus, d)  — input tensor
+    y   : (N_samples,)           — system margin at T_pred (regression target)
+    lbl : (N_samples,)           — 1 if this sample came from an ATTACKED day
+                                    AND falsification is active in its monitoring
+                                    window, else 0. This is the TRUE detection
+                                    label (presence of FDI), independent of
+                                    whether the margin has yet crossed threshold.
     """
-    X_list, y_list = [], []
-
+    X_list, y_list, lbl_list = [], [], []
     def _add_samples(results, pf_results, is_attack: bool):
         for idx, (res, pf_day) in enumerate(zip(results, pf_results)):
             T = len(res.system_margin_true)
