@@ -7,10 +7,9 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:a100:1
-#SBATCH --output=/home/gkianfar/scratch/Amin/CB/Cyber/logs/%x_%j.out
-#SBATCH --error=/home/gkianfar/scratch/Amin/CB/Cyber/logs/%x_%j.err
-#SBATCH --mail-user=your_email@domain.com
-#SBATCH --mail-type=END,FAIL
+#SBATCH --output=/home/gkianfar/scratch/Amin/CB/results/logs/%x_%j.out
+#SBATCH --error=/home/gkianfar/scratch/Amin/CB/results/logs/%x_%j.err
+
 
 # ── Environment ────────────────────────────────────────────────────────────
 module purge
