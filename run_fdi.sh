@@ -45,7 +45,7 @@ echo "Starting FDI detection experiment..."
 python main_train.py \
     --excel   "$EXCEL_PATH" \
     --scenario both \
-    --n_days  356 \
+    --n_days  150 \
     --epochs  800 \
     --use_llm \
     --sensitivity \
