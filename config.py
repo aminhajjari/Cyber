@@ -141,7 +141,7 @@ T_INTERVALS     = 24        # 24 hourly intervals per day
 T_MONITORING    = 6         # |T_m|: monitoring window (hours)
 T_PRED_AHEAD    = 2         # T_pred: predict this many hours ahead
 T_PREP          = 1         # T_prep: required operator response window (hours)
-N_DAYS          = 356       # Training days
+N_DAYS          = 150       # Monte-Carlo 24h realizations (see thesis note)
 
 # ─── Attack Parameters ────────────────────────────────────────────────────────
 # Attack scenarios
@@ -191,15 +191,16 @@ GEN_COST_NOISE_STD  = 0.0   # Perfect info (relaxed in sensitivity analysis)
 
 # ─── CNN Detection Model ──────────────────────────────────────────────────────
 CNN_CONFIG = {
-    "conv1d_filters":   128,
+    "conv1d_filters":   64,
     "conv1d_kernel":    3,
-    "pool_size":        1,       # max-pool
+    "pool_size":        2,       # max-pool (lighter head)
     "fc_layers":        [128, 64],
     "activation":       "relu",
-    "dropout":          0.2,
+    "dropout":          0.3,
     "batch_size":       32,
     "epochs":           800,
     "learning_rate":    1e-3,    # Adam default
+    "lambda_cls":       1.0,     # weight of classification-head loss
     "train_ratio":      0.7,
     "val_ratio":        0.15,
     "test_ratio":       0.15,
