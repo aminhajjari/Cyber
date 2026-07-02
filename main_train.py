@@ -158,6 +158,8 @@ def main():
         X_tr,y_tr = X[:n1], y[:n1]
         X_v, y_v  = X[n1:n2], y[n1:n2]
         X_te,y_te = X[n2:], y[n2:]
+        lbl_tr    = lbl[:n1]
+        lbl_v     = lbl[n1:n2]
         lbl_te    = lbl[n2:]
 
         n_bus, d = X_tr.shape[1], X_tr.shape[2]
@@ -169,7 +171,7 @@ def main():
             cnn = DetectionModelTrainer.load(cnn_path)
         else:
             cnn = DetectionModelTrainer("CNN", n_bus, d, cfg)
-            cnn.fit(X_tr, y_tr, X_v, y_v)
+            cnn.fit(X_tr, y_tr, X_v, y_v, lbl_train=lbl_tr, lbl_val=lbl_v)
             cnn.save(cnn_path)
         metrics["CNN"] = cnn.evaluate(X_te, y_te, f"CNN/{scen}", lbl_true=lbl_te)
 
@@ -178,12 +180,12 @@ def main():
             mlp = DetectionModelTrainer.load(mlp_path)
         else:
             mlp = DetectionModelTrainer("MLP", n_bus, d, cfg)
-            mlp.fit(X_tr, y_tr, X_v, y_v)
+            mlp.fit(X_tr, y_tr, X_v, y_v, lbl_train=lbl_tr, lbl_val=lbl_v)
             mlp.save(mlp_path)
         metrics["MLP"] = mlp.evaluate(X_te, y_te, f"MLP/{scen}", lbl_true=lbl_te)
 
         svr = SVRDetector()
-        svr.fit(X_tr, y_tr)
+        svr.fit(X_tr, y_tr, lbl_train=lbl_tr)
         metrics["SVR"] = svr.evaluate(X_te, y_te, f"SVR/{scen}", lbl_true=lbl_te)
 
         print_table(metrics, scen)
