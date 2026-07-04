@@ -23,7 +23,8 @@ from power_flow      import BackwardForwardSweep, generate_daily_profiles
 from attack_model    import AttackSimulator
 from detection_model import DetectionModelTrainer, SVRDetector, build_dataset
 from llm_explainer   import LLMExplainer, build_attack_context
-
+from detection_model import build_input_tensor
+from improvements import bus_saliency, localization_score, group_split_by_day
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -190,24 +191,77 @@ def main():
 
         print_table(metrics, scen)
 
-        # LLM explanations for 3 interesting attack cases
-        interesting = [r for r in atk_r if r.attack_success][:3]
-        reports = []
+        # ── LLM interpretability on the DETECTOR'S decision ──────────────────
+        # Pick 3 cases: successful attacks first; for S2 (rarely "successful")
+        # fall back to the days with the strongest falsification signature.
+        # NOTE: index-based selection — AttackResult holds numpy arrays, so
+        # `res in list` would raise "truth value of an array is ambiguous".
+        succ_idx = [i for i, r in enumerate(atk_r) if r.attack_success]
+        if len(succ_idx) < 3:
+            strength = lambda i: (np.abs(atk_r[i].falsification_signal).sum()
+                                  if atk_r[i].falsification_signal is not None else 0.0)
+            extra = sorted([i for i in range(len(atk_r)) if i not in succ_idx],
+                           key=strength, reverse=True)
+            sel = (succ_idx + extra)[:3]
+        else:
+            sel = succ_idx[:3]
+        interesting = [atk_r[i] for i in sel]
+
+        reports, loc_scores = [], []
+        tmin = T_MONITORING + T_PRED_AHEAD
         for res in interesting:
-            alert_h = max(0, (res.outage_time or 16) - 2)
+            alert_h = int(min(23, max(tmin, (res.outage_time or 16) - 2)))
+
+            zeros = np.zeros_like(res.original_dispatch)
+            x_sample = build_input_tensor(
+                gen_dispatch_hat=res.original_dispatch,
+                gen_dispatch_meas=res.falsified_dispatch,
+                curtail_hat=zeros, curtail_meas=zeros,
+                stor_hat=zeros, stor_meas=zeros,
+                V_mag=pf_all[res.day]["V_mag"], theta=pf_all[res.day]["theta"],
+                t_pred=alert_h, T_m=T_MONITORING, feature_set="full")
+            if x_sample is None:
+                continue
+
+            # detector's OWN outputs + saliency (uses the trained CNN)
+            X1 = x_sample[None, ...]
+            pred_margin = float(cnn.predict_margin(X1)[0])
+            atk_prob    = float(cnn.predict_proba(X1)[0])
+            sal   = bus_saliency(cnn.model, x_sample, cnn.scaler_X, head="cls")
+            order = np.argsort(sal)[::-1]
+            sal_buses = [int(b) + 1 for b in order[:5]]
+            sal_mags  = [float(sal[b]) for b in order[:5]]
+
+            # explanation faithfulness vs the true attack (evaluation metric)
+            true_atk = [int(i) + 1 for i in
+                        np.where(np.abs(res.falsification_signal).sum(0) > 1e-6)[0]]
+            loc = localization_score(sal, true_atk)
+            loc_scores.append(loc)
+
             class _PF:
                 V_pu = pf_all[res.day]["V_mag"][alert_h]
             ctx = build_attack_context(
                 res, _PF(), alert_h,
                 load_MW[res.day, alert_h], der_gen_MW[res.day, alert_h],
-                confidence=0.92)
-            print(f"\n[LLM] Day={res.day}, Hour={alert_h}, Scenario={scen}, "
-                  f"MGs={res.affected_microgrids}")
+                model_pred_margin=pred_margin, attack_prob=atk_prob,
+                saliency_buses=sal_buses, saliency_mags=sal_mags)
+
+            print(f"\n[LLM] Day={res.day} Hour={alert_h} {scen} | "
+                  f"P(attack)={atk_prob:.2f} pred_margin={pred_margin:+.4f} | "
+                  f"saliency→MGs={ctx.affected_microgrids} | "
+                  f"localization P@k={loc['precision@k']:.2f}")
             report = explainer.explain(ctx)
             print(report)
             reports.append({"day": res.day, "hour": alert_h, "report": report,
-                            "affected_microgrids": res.affected_microgrids})
+                            "attack_prob": atk_prob, "pred_margin": pred_margin,
+                            "saliency_buses": sal_buses, "localization": loc,
+                            "affected_microgrids": ctx.affected_microgrids})
 
+        mean_loc = {m: (float(np.nanmean([s[m] for s in loc_scores]))
+                        if loc_scores else float("nan"))
+                    for m in ("precision@k", "recall@k", "IoU")}
+        print(f"[Interpretability/{scen}] mean localization over "
+              f"{len(loc_scores)} cases: {mean_loc}")
         if args.sensitivity:
             sens = {}
             for sigma in SIGMA_LEVELS:
@@ -228,6 +282,7 @@ def main():
         out = {"metrics": metrics, "feasibility": feas, "success_ratio": succ,
                "sensitivity": {str(k): v for k,v in sens.items()},
                "llm_reports": reports,
+               "localization_mean": mean_loc,
                "target_der": args.target_der}
         with open(os.path.join(results_dir, f"results_{scen}.json"), "w") as f:
             json.dump(out, f, indent=2, default=str)
