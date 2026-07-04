@@ -110,9 +110,10 @@ def build_dataset(attack_results:  list,
                                     label (presence of FDI), independent of
                                     whether the margin has yet crossed threshold.
     """
-    X_list, y_list, lbl_list = [], [], []
+    X_list, y_list, lbl_list, day_list = [], [], [], []
     def _add_samples(results, pf_results, is_attack: bool):
         for idx, (res, pf_day) in enumerate(zip(results, pf_results)):
+            day_id = getattr(res, "day", idx)
             T = len(res.system_margin_true)
             # Which hours have active falsification injected?
             fs = getattr(res, "falsification_signal", None)
@@ -135,6 +136,7 @@ def build_dataset(attack_results:  list,
                     continue
                 X_list.append(x)
                 y_list.append(res.system_margin_true[t_pred])
+                day_list.append(day_id)
 
                 # LABEL = 1 if this is an attacked day AND the monitoring
                 # window [t_pred - T_PRED_AHEAD - T_m, t_pred - T_PRED_AHEAD]
@@ -155,10 +157,11 @@ def build_dataset(attack_results:  list,
     X   = np.stack(X_list).astype(np.float32)
     y   = np.array(y_list,   dtype=np.float32)
     lbl = np.array(lbl_list, dtype=np.int64)
+    day = np.array(day_list, dtype=np.int64)
     n_pos = int(lbl.sum())
     print(f"[Dataset] Built {X.shape[0]} samples, X shape: {X.shape} | "
           f"positives (attacked)={n_pos} ({100*n_pos/len(lbl):.1f}%)")
-    return X, y, lbl
+    return X, y, lbl, day
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -247,8 +250,11 @@ class DetectionModelTrainer:
             self.model = FDI_MLP(self.n_bus * d_features, self.cfg).to(self.device)
         else:
             raise ValueError(f"Unknown model_type: {self.model_type}")
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.cfg["learning_rate"])
+        self.optimizer = optim.Adam(self.model.parameters(),
+                                    lr=self.cfg["learning_rate"],
+                                    weight_decay=self.cfg.get("weight_decay", 1e-4))
         self.mse = nn.MSELoss()
+        self.threshold = 0.5   # decision cutoff, tuned on validation in fit()
         print(f"[{self.model_type}] Parameters: "
               f"{sum(p.numel() for p in self.model.parameters()):,}")
 
@@ -299,25 +305,45 @@ class DetectionModelTrainer:
                 tl += loss.item() * len(yb)
             tl /= len(ds)
 
-            # validation (combined loss)
-            self.model.eval(); vl = 0.0
+            # validation — regression and classification losses SEPARATELY.
+            # The margin head converges trivially, so selecting on the
+            # combined loss lets the exploding BCE (S2) hijack model
+            # selection. Checkpoint on the classification loss instead.
+            self.model.eval()
             with torch.no_grad():
                 Xv = torch.tensor(Xva, dtype=torch.float32).to(self.device)
                 yv = torch.tensor(yva, dtype=torch.float32).to(self.device)
                 lv = torch.tensor(lbl_val, dtype=torch.float32).to(self.device)
                 pr, pc = self.model(Xv)
-                vl = (self.mse(pr, yv) + self.lambda_cls * self.bce(pc, lv)).item()
+                vl_reg = self.mse(pr, yv).item()
+                vl_cls = self.bce(pc, lv).item()
+            vl = vl_cls
             history["train_loss"].append(tl); history["val_loss"].append(vl)
             if vl < best_val:
                 best_val = vl
                 best_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
             if (epoch + 1) % 100 == 0:
                 print(f"[{self.model_type}] Epoch {epoch+1:4d} | "
-                      f"train {tl:.4f} | val {vl:.4f}")
+                      f"train {tl:.4f} | val_cls {vl_cls:.4f} | val_reg {vl_reg:.4f}")
         if best_state is not None:
             self.model.load_state_dict(best_state)
-        print(f"[{self.model_type}] Training done. Best val loss: {best_val:.4f}")
+        self.tune_threshold(X_val, lbl_val)   # pick operating point on val
+        print(f"[{self.model_type}] Training done. Best val_cls loss: {best_val:.4f}")
         return history
+
+    def tune_threshold(self, X_val, lbl_val):
+        """Pick the probability cutoff that maximizes F1 on validation."""
+        from sklearn.metrics import f1_score
+        lbl_val = np.asarray(lbl_val)
+        if lbl_val.min() == lbl_val.max():      # only one class present
+            self.threshold = 0.5
+            return self.threshold
+        prob = self.predict_proba(X_val)
+        grid = np.linspace(0.05, 0.95, 19)
+        f1s = [f1_score(lbl_val, (prob > t).astype(int), zero_division=0) for t in grid]
+        self.threshold = float(grid[int(np.argmax(f1s))])
+        print(f"[{self.model_type}] tuned decision threshold = {self.threshold:.2f}")
+        return self.threshold
 
     def predict_margin(self, X):
         Xn = self.scaler_X.transform(X.reshape(len(X), -1)).reshape(X.shape)
@@ -345,7 +371,7 @@ class DetectionModelTrainer:
         if lbl_true is None:
             lbl_true = (y_true < SECURITY_THRESHOLD_MW).astype(int)
         prob = self.predict_proba(X)
-        y_pred_cls = (prob > 0.5).astype(int)
+        y_pred_cls = (prob > self.threshold).astype(int)
         y_true_cls = lbl_true.astype(int)
 
         # regression MSE split by true label
@@ -373,7 +399,8 @@ class DetectionModelTrainer:
             pickle.dump({"model_state":self.model.state_dict(),
                          "model_type":self.model_type,"n_bus":self.n_bus,
                          "d_features":self.d_features,"cfg":self.cfg,
-                         "scaler_X":self.scaler_X,"scaler_y":self.scaler_y}, f)
+                         "scaler_X":self.scaler_X,"scaler_y":self.scaler_y,
+                         "threshold":getattr(self,'threshold',0.5)}, f)
         print(f"[{self.model_type}] Model saved to {path}")
 
     @classmethod
@@ -383,6 +410,7 @@ class DetectionModelTrainer:
         tr=cls(st["model_type"],st["n_bus"],st["d_features"],st["cfg"],device)
         tr.model.load_state_dict(st["model_state"])
         tr.scaler_X=st["scaler_X"]; tr.scaler_y=st["scaler_y"]
+        tr.threshold=st.get("threshold",0.5)
         return tr
 
 
