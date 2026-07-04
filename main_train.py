@@ -24,7 +24,8 @@ from attack_model    import AttackSimulator
 from detection_model import DetectionModelTrainer, SVRDetector, build_dataset
 from llm_explainer   import LLMExplainer, build_attack_context
 from detection_model import build_input_tensor
-from improvements import bus_saliency, localization_score, group_split_by_day
+from improvements    import bus_saliency, localization_score, group_split_by_day
+
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -149,19 +150,13 @@ def main():
             system, storage, load_MW, der_gen_MW, scen, args.seed,
             target_der_type=args.target_der)
 
-        X, y, lbl = build_dataset(atk_r, norm_r, pf_all, pf_all,
-                               T_m=T_MONITORING, feature_set="full")
-        rng  = np.random.default_rng(args.seed)
-        idx  = rng.permutation(len(X))
-        X, y, lbl = X[idx], y[idx], lbl[idx]
-        n    = len(X)
-        n1, n2 = int(.70*n), int(.85*n)
-        X_tr,y_tr = X[:n1], y[:n1]
-        X_v, y_v  = X[n1:n2], y[n1:n2]
-        X_te,y_te = X[n2:], y[n2:]
-        lbl_tr    = lbl[:n1]
-        lbl_v     = lbl[n1:n2]
-        lbl_te    = lbl[n2:]
+        X, y, lbl, day = build_dataset(atk_r, norm_r, pf_all, pf_all,
+                                       T_m=T_MONITORING, feature_set="full")
+        # leakage-free split: all windows of a Monte-Carlo day stay together
+        itr, iva, ite = group_split_by_day(day, 0.70, 0.15, seed=args.seed)
+        X_tr, y_tr, lbl_tr = X[itr], y[itr], lbl[itr]
+        X_v,  y_v,  lbl_v  = X[iva], y[iva], lbl[iva]
+        X_te, y_te, lbl_te = X[ite], y[ite], lbl[ite]
 
         n_bus, d = X_tr.shape[1], X_tr.shape[2]
         cfg = {**CNN_CONFIG, "epochs": args.epochs}
@@ -194,7 +189,7 @@ def main():
         # ── LLM interpretability on the DETECTOR'S decision ──────────────────
         # Pick 3 cases: successful attacks first; for S2 (rarely "successful")
         # fall back to the days with the strongest falsification signature.
-        # NOTE: index-based selection — AttackResult holds numpy arrays, so
+        # Index-based selection — AttackResult holds numpy arrays, so
         # `res in list` would raise "truth value of an array is ambiguous".
         succ_idx = [i for i, r in enumerate(atk_r) if r.attack_success]
         if len(succ_idx) < 3:
@@ -248,7 +243,7 @@ def main():
 
             print(f"\n[LLM] Day={res.day} Hour={alert_h} {scen} | "
                   f"P(attack)={atk_prob:.2f} pred_margin={pred_margin:+.4f} | "
-                  f"saliency→MGs={ctx.affected_microgrids} | "
+                  f"saliency->MGs={ctx.affected_microgrids} | "
                   f"localization P@k={loc['precision@k']:.2f}")
             report = explainer.explain(ctx)
             print(report)
@@ -262,6 +257,7 @@ def main():
                     for m in ("precision@k", "recall@k", "IoU")}
         print(f"[Interpretability/{scen}] mean localization over "
               f"{len(loc_scores)} cases: {mean_loc}")
+
         if args.sensitivity:
             sens = {}
             for sigma in SIGMA_LEVELS:
