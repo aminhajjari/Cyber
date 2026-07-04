@@ -49,6 +49,12 @@ class AttackContext:
     confidence:         float = 0.0
     # NEW: micro-grid(s) impacted by the attack
     affected_microgrids: List[str] = None
+    # NEW: detector's own attack probability for THIS sample (0-1). When set,
+    # the report is grounded in what the MODEL decided, not the ground truth.
+    attack_probability: Optional[float] = None
+    # NEW: whether top_anomaly_buses came from model saliency (True) or from
+    # the ground-truth falsification vector (False, legacy fallback).
+    buses_from_saliency: bool = False
 
 
 SYSTEM_PROMPT = """You are an expert power system security analyst specializing in 
@@ -80,10 +86,15 @@ def _build_prompt(ctx: AttackContext) -> str:
     v_min_bus = int(np.argmin(ctx.bus_voltages)) + 1
     v_min_val = float(np.min(ctx.bus_voltages))
 
+    bus_unit = "saliency" if ctx.buses_from_saliency else "MW"
     anomaly_str = ", ".join([
-        f"Bus {b} [{_der_type_for_bus(b)}, {BUS_TO_MICROGRID.get(b,'?')}] ({m:+.3f} MW)"
+        f"Bus {b} [{_der_type_for_bus(b)}, {BUS_TO_MICROGRID.get(b,'?')}] ({m:.3f} {bus_unit})"
         for b, m in zip(ctx.top_anomaly_buses[:5], ctx.anomaly_magnitudes[:5])
     ]) or "Localizing..."
+    bus_header = ("BUSES DRIVING THE DETECTOR'S DECISION (CNN saliency, normalized)"
+                  if ctx.buses_from_saliency else "ANOMALOUS BUSES (ground-truth)")
+    prob_line = (f"Detector attack probability: {ctx.attack_probability*100:.1f}%\n"
+                 if ctx.attack_probability is not None else "")
 
     scenario_desc = {"S1": "generation dispatch falsification",
                      "S2": "load curtailment falsification"}.get(ctx.scenario, "unknown")
@@ -93,18 +104,25 @@ def _build_prompt(ctx: AttackContext) -> str:
     mg_str = ", ".join(ctx.affected_microgrids) if ctx.affected_microgrids else "Unknown"
 
     return f"""FDI ATTACK ALERT — Hour {ctx.current_hour:02d}:00
+You are interpreting the decision of a trained CNN detector. The margin and the
+flagged buses below are the MODEL'S OWN OUTPUTS (prediction + saliency), not
+ground truth. Explain WHY the model raised this alarm and what it implies.
+
 Status: {'[ALARM]' if ctx.alarm_triggered else '[WARNING]'} | {urgency}
 Confidence: {ctx.confidence*100:.1f}% | Type: {scenario_desc}
-AFFECTED MICRO-GRID(S): {mg_str}
+AFFECTED MICRO-GRID(S) (from model-attributed buses): {mg_str}
+
+DETECTOR OUTPUT:
+  {prob_line}  Predicted system margin (2h ahead) = {ctx.predicted_margin:.4f} MW
+  Security threshold = {SECURITY_THRESHOLD_MW} MW
 
 SYSTEM STATE:
   Load={ctx.total_load_MW:.4f} MW | Gen={ctx.total_gen_MW:.4f} MW | DER(WT+PV+BM)={ctx.total_pv_MW:.4f} MW
-  Reserve={ctx.reserve_MW:.4f} MW (threshold={SECURITY_THRESHOLD_MW} MW)
-  Predicted margin (2h ahead)={ctx.predicted_margin:.4f} MW
+  Reserve={ctx.reserve_MW:.4f} MW
   Min voltage={v_min_val:.4f} pu at Bus {v_min_bus}
 
 MARGIN HISTORY (last {len(ctx.margin_history)}h): {[f"{m:.3f}" for m in ctx.margin_history]}
-ANOMALOUS BUSES: {anomaly_str}
+{bus_header}: {anomaly_str}
 
 NETWORK: IEEE 69-bus radial, partitioned into 5 micro-grids:
   MG1(buses 49-54) MG2(28-35) MG3(18-27) MG4(6-17,40-48,55-58) MG5(1-5,36-39,59-69)
@@ -293,39 +311,74 @@ ESTIMATED RECOVERY TIME:
 
 def build_attack_context(attack_result, pf_result, current_hour: int,
                           load_MW_t: np.ndarray, der_gen_MW_t: np.ndarray,
+                          model_pred_margin: float = None,   # NEW: cnn.predict_margin
+                          attack_prob: float = None,         # NEW: cnn.predict_proba
+                          saliency_buses: List[int] = None,  # NEW: 1-idx, from bus_saliency
+                          saliency_mags:  List[float] = None,# NEW: normalized saliency
                           confidence: float = 0.90) -> AttackContext:
+    """
+    Build the LLM context. When `model_pred_margin` / `attack_prob` /
+    `saliency_buses` are supplied, the report is grounded in the DETECTOR'S OWN
+    decision (this is the interpretability path). If they are omitted, it falls
+    back to the legacy ground-truth behavior for backward compatibility.
+    """
     T = len(attack_result.system_margin_true)
     ws = max(0, current_hour - 6)
 
-    if attack_result.falsification_signal is not None:
+    # ── Buses: prefer model saliency; else legacy ground-truth falsification ──
+    if saliency_buses is not None:
+        top_buses = [int(b) for b in saliency_buses[:5]]
+        top_mags  = [float(m) for m in (saliency_mags or [0.0]*len(top_buses))[:5]]
+        buses_from_saliency = True
+    elif attack_result.falsification_signal is not None:
         delta_t  = np.abs(attack_result.falsification_signal[current_hour])
         top_idx  = np.argsort(delta_t)[::-1][:10]
-        top_buses = [int(i)+1 for i in top_idx if delta_t[i] > 1e-4]
-        top_mags  = [float(delta_t[i]) for i in top_idx if delta_t[i] > 1e-4]
+        top_buses = [int(i)+1 for i in top_idx if delta_t[i] > 1e-4][:5]
+        top_mags  = [float(delta_t[i]) for i in top_idx if delta_t[i] > 1e-4][:5]
+        buses_from_saliency = False
     else:
-        top_buses, top_mags = [], []
+        top_buses, top_mags, buses_from_saliency = [], [], False
+
+    # ── Micro-grids: derive from the (model-attributed) top buses ────────────
+    affected_mgs = sorted(set(
+        BUS_TO_MICROGRID.get(b, "UNASSIGNED") for b in top_buses
+    )) if top_buses else (getattr(attack_result, "affected_microgrids", None) or [])
+
+    # ── Margin: prefer the model's prediction; else ground truth ─────────────
+    if model_pred_margin is not None:
+        predicted_margin = float(model_pred_margin)
+    else:
+        predicted_margin = float(attack_result.system_margin_true[min(current_hour+2, T-1)])
 
     future = attack_result.system_margin_true[current_hour:]
     below  = np.where(future < SECURITY_THRESHOLD_MW)[0]
     hours_to_outage = int(below[0]) if len(below) > 0 else None
-    predicted_margin = float(attack_result.system_margin_true[min(current_hour+2, T-1)])
+
+    if attack_prob is not None:
+        alarm = attack_prob > 0.5
+        conf  = float(attack_prob)
+    else:
+        alarm = predicted_margin < SECURITY_THRESHOLD_MW
+        conf  = confidence
 
     return AttackContext(
         scenario=attack_result.scenario, current_hour=current_hour,
         predicted_margin=predicted_margin,
         actual_margin=float(attack_result.system_margin_true[current_hour]),
         margin_history=attack_result.system_margin_true[ws:current_hour+1].tolist(),
-        alarm_triggered=(predicted_margin < SECURITY_THRESHOLD_MW),
+        alarm_triggered=alarm,
         hours_to_outage=hours_to_outage,
-        top_anomaly_buses=top_buses[:5], anomaly_magnitudes=top_mags[:5],
+        top_anomaly_buses=top_buses, anomaly_magnitudes=top_mags,
         bus_voltages=pf_result.V_pu,
         total_load_MW=float(load_MW_t.sum()),
         total_gen_MW=float(attack_result.original_dispatch[current_hour].sum()),
         total_pv_MW=float(der_gen_MW_t.sum()),
         reserve_MW=float(load_MW_t.sum() * 0.05),
         falsification_signal=attack_result.falsification_signal,
-        confidence=confidence,
-        affected_microgrids=getattr(attack_result, "affected_microgrids", None) or [],
+        confidence=conf,
+        affected_microgrids=affected_mgs,
+        attack_probability=attack_prob,
+        buses_from_saliency=buses_from_saliency,
     )
 
 
