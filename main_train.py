@@ -15,7 +15,7 @@ import numpy as np
 from datetime import datetime
 
 from config import (BUS_EXCEL_PATH, RESULTS_DIR, MODEL_DIR, N_DAYS,
-                    RANDOM_SEED, CNN_CONFIG, T_MONITORING, SIGMA_LEVELS,
+                    RANDOM_SEED, CNN_CONFIG, T_MONITORING, T_PRED_AHEAD, SIGMA_LEVELS,
                     SECURITY_THRESHOLD_MW, MICROGRID_MAP)
 from data_loader     import (load_ieee69_from_excel, assign_der_units,
                               assign_storage_buses, get_microgrid_summary)
@@ -24,7 +24,8 @@ from attack_model    import AttackSimulator
 from detection_model import DetectionModelTrainer, SVRDetector, build_dataset
 from llm_explainer   import LLMExplainer, build_attack_context
 from detection_model import build_input_tensor
-from improvements    import bus_saliency, localization_score, group_split_by_day
+from improvements    import (bus_saliency, localization_score, group_split_by_day,
+                              deletion_insertion_score)
 
 
 def parse_args():
@@ -39,6 +40,12 @@ def parse_args():
     p.add_argument("--target_der", type=str, default=None,
                    choices=[None, "WT", "PV", "BM"],
                    help="Confine S1 attack to one DG technology (NEW)")
+    p.add_argument("--feature_set", type=str, default="full",
+                   choices=["PV", "PVtheta", "full", "network_only"],
+                   help="'network_only' drops the predicted-vs-actual dispatch "
+                        "pair and keeps only V_mag/theta -- use this to check "
+                        "whether detection accuracy survives without the "
+                        "near-trivial mismatch signal (NEW, ablation).")
     p.add_argument("--seed",       type=int, default=RANDOM_SEED)
     return p.parse_args()
 
@@ -151,7 +158,7 @@ def main():
             target_der_type=args.target_der)
 
         X, y, lbl, day = build_dataset(atk_r, norm_r, pf_all, pf_all,
-                                       T_m=T_MONITORING, feature_set="full")
+                                       T_m=T_MONITORING, feature_set=args.feature_set)
         # leakage-free split: all windows of a Monte-Carlo day stay together
         itr, iva, ite = group_split_by_day(day, 0.70, 0.15, seed=args.seed)
         X_tr, y_tr, lbl_tr = X[itr], y[itr], lbl[itr]
@@ -214,7 +221,7 @@ def main():
                 curtail_hat=zeros, curtail_meas=zeros,
                 stor_hat=zeros, stor_meas=zeros,
                 V_mag=pf_all[res.day]["V_mag"], theta=pf_all[res.day]["theta"],
-                t_pred=alert_h, T_m=T_MONITORING, feature_set="full")
+                t_pred=alert_h, T_m=T_MONITORING, feature_set=args.feature_set)
             if x_sample is None:
                 continue
 
@@ -232,6 +239,10 @@ def main():
                         np.where(np.abs(res.falsification_signal).sum(0) > 1e-6)[0]]
             loc = localization_score(sal, true_atk)
             loc_scores.append(loc)
+            # Ground-truth-FREE faithfulness (also computable at deployment,
+            # unlike loc above which needs the true attacked buses):
+            di = deletion_insertion_score(cnn.model, x_sample, sal, cnn.scaler_X,
+                                          head="cls", device=None)
 
             class _PF:
                 V_pu = pf_all[res.day]["V_mag"][alert_h]
@@ -244,12 +255,14 @@ def main():
             print(f"\n[LLM] Day={res.day} Hour={alert_h} {scen} | "
                   f"P(attack)={atk_prob:.2f} pred_margin={pred_margin:+.4f} | "
                   f"saliency->MGs={ctx.affected_microgrids} | "
-                  f"localization P@k={loc['precision@k']:.2f}")
+                  f"localization P@k={loc['precision@k']:.2f} | "
+                  f"deletion_drop={di['drop_frac']:.2f} insertion_recov={di['recovered_frac']:.2f}")
             report = explainer.explain(ctx)
             print(report)
             reports.append({"day": res.day, "hour": alert_h, "report": report,
                             "attack_prob": atk_prob, "pred_margin": pred_margin,
                             "saliency_buses": sal_buses, "localization": loc,
+                            "deletion_insertion": di,
                             "affected_microgrids": ctx.affected_microgrids})
 
         mean_loc = {m: (float(np.nanmean([s[m] for s in loc_scores]))
@@ -279,7 +292,8 @@ def main():
                "sensitivity": {str(k): v for k,v in sens.items()},
                "llm_reports": reports,
                "localization_mean": mean_loc,
-               "target_der": args.target_der}
+               "target_der": args.target_der,
+               "feature_set": args.feature_set}
         with open(os.path.join(results_dir, f"results_{scen}.json"), "w") as f:
             json.dump(out, f, indent=2, default=str)
 
