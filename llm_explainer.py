@@ -64,7 +64,18 @@ monitoring an IEEE 69-bus distribution network that has been partitioned into 5
 autonomous micro-grids (MG1-MG5), each containing a mix of wind turbines (WT),
 photovoltaic (PV), and biomass (BM) generators.
 
-Provide concise, technical, actionable analysis. Format as:
+Respond in TWO parts, in this exact order:
+
+PART 1 — a single JSON object on its own line, with EXACTLY these keys:
+  "attack_location_buses": [list of int bus numbers you believe are compromised],
+  "affected_microgrids": [list of MG strings like "MG4"],
+  "severity": one of "Critical", "High", "Medium",
+  "mechanism_summary": one sentence,
+  "confidence_0to1": float
+Only include buses/MGs you can justify from the data given to you below — do not
+guess buses that were not mentioned in the detector output.
+
+PART 2 — the human-readable report, formatted as:
 - ATTACK LOCATION: [specific buses/feeders/DERs/micro-grid(s)]
 - SEVERITY: [Critical/High/Medium] with brief justification
 - MECHANISM: [2-3 sentences on how the attack works]
@@ -73,6 +84,66 @@ Provide concise, technical, actionable analysis. Format as:
 - IMMEDIATE ACTIONS (next 30 min): [numbered list]
 - PREVENTIVE MEASURES (24h): [numbered list]
 - ESTIMATED RECOVERY TIME: [if outage occurs]"""
+
+
+import json
+import re
+
+
+def parse_structured_report(raw_text: str) -> Optional[Dict]:
+    """
+    Pull the PART-1 JSON object out of the LLM's raw response. Returns None
+    if no valid JSON object with the expected keys is found (e.g. the model
+    ignored the instruction) so callers can fall back gracefully.
+    """
+    expected = {"attack_location_buses", "affected_microgrids", "severity",
+                "mechanism_summary", "confidence_0to1"}
+    # Try every {...} block in the text, first-to-last, keep the first that parses
+    # and has the expected keys.
+    for m in re.finditer(r"\{[^{}]*\}", raw_text, flags=re.DOTALL):
+        try:
+            obj = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            continue
+        if expected.issubset(obj.keys()):
+            obj["attack_location_buses"] = [int(b) for b in obj["attack_location_buses"]]
+            return obj
+    return None
+
+
+def grounding_score(structured: Optional[Dict], saliency_buses: List[int],
+                     true_attacked_buses: Optional[List[int]] = None) -> Dict[str, float]:
+    """
+    Does the LLM's STATED attack location actually match what the detector's
+    saliency map (and, offline, the ground truth) say? This is the piece that
+    closes the loop between "the CNN attended to the right buses" (measured by
+    localization_score/deletion_insertion_score on the saliency map) and
+    "the LLM correctly reported that" (measured here on the LLM's own claims).
+    A free-text report can sound confident and specific while silently
+    hallucinating bus numbers the detector never flagged -- this catches that.
+
+    - vs_saliency: overlap between LLM-claimed buses and the detector's own
+      top saliency buses. Ground-truth-FREE, usable at deployment.
+    - vs_ground_truth: overlap between LLM-claimed buses and the truly
+      falsified buses. Only computable in simulation/evaluation.
+    """
+    def _jaccard(a: List[int], b: List[int]) -> float:
+        A, B = set(a), set(b)
+        if not A and not B:
+            return float("nan")
+        if not A or not B:
+            return 0.0
+        return len(A & B) / len(A | B)
+
+    if structured is None:
+        return {"parsed": False, "vs_saliency": float("nan"),
+                "vs_ground_truth": float("nan")}
+
+    claimed = structured.get("attack_location_buses", [])
+    out = {"parsed": True, "vs_saliency": _jaccard(claimed, saliency_buses)}
+    out["vs_ground_truth"] = (_jaccard(claimed, true_attacked_buses)
+                              if true_attacked_buses is not None else float("nan"))
+    return out
 
 
 def _der_type_for_bus(bus_id: int) -> str:
@@ -270,7 +341,15 @@ class LLMExplainer:
             "Test islanding readiness for all 5 micro-grids under N-1 DG failure",
         ]
 
-        return f"""
+        json_header = json.dumps({
+            "attack_location_buses": ctx.top_anomaly_buses,
+            "affected_microgrids":   mg_list,
+            "severity":              severity.capitalize(),
+            "mechanism_summary":     mechanism.split(".")[0].strip() + ".",
+            "confidence_0to1":       round(ctx.confidence, 3),
+        })
+
+        return f"""{json_header}
 ================================================================================
    FDI ATTACK ANALYSIS REPORT — Hour {ctx.current_hour:02d}:00 — {severity}
 ================================================================================
