@@ -312,6 +312,7 @@ def main():
                "sensitivity": {str(k): v for k,v in sens.items()},
                "llm_reports": reports,
                "localization_mean": mean_loc,
+               "grounding_mean": mean_ground,
                "target_der": args.target_der,
                "feature_set": args.feature_set}
         with open(os.path.join(results_dir, f"results_{scen}.json"), "w") as f:
