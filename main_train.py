@@ -22,7 +22,8 @@ from data_loader     import (load_ieee69_from_excel, assign_der_units,
 from power_flow      import BackwardForwardSweep, generate_daily_profiles
 from attack_model    import AttackSimulator
 from detection_model import DetectionModelTrainer, SVRDetector, build_dataset
-from llm_explainer   import LLMExplainer, build_attack_context
+from llm_explainer   import (LLMExplainer, build_attack_context,
+                              parse_structured_report, grounding_score)
 from detection_model import build_input_tensor
 from improvements    import (bus_saliency, localization_score, group_split_by_day,
                               deletion_insertion_score)
@@ -259,10 +260,18 @@ def main():
                   f"deletion_drop={di['drop_frac']:.2f} insertion_recov={di['recovered_frac']:.2f}")
             report = explainer.explain(ctx)
             print(report)
+
+            structured = parse_structured_report(report)
+            ground = grounding_score(structured, sal_buses, true_atk)
+            print(f"[Grounding] parsed={ground['parsed']} "
+                  f"vs_saliency(Jaccard)={ground['vs_saliency']:.2f} "
+                  f"vs_ground_truth(Jaccard)={ground['vs_ground_truth']:.2f}")
+
             reports.append({"day": res.day, "hour": alert_h, "report": report,
                             "attack_prob": atk_prob, "pred_margin": pred_margin,
                             "saliency_buses": sal_buses, "localization": loc,
                             "deletion_insertion": di,
+                            "structured": structured, "grounding": ground,
                             "affected_microgrids": ctx.affected_microgrids})
 
         mean_loc = {m: (float(np.nanmean([s[m] for s in loc_scores]))
@@ -270,6 +279,17 @@ def main():
                     for m in ("precision@k", "recall@k", "IoU")}
         print(f"[Interpretability/{scen}] mean localization over "
               f"{len(loc_scores)} cases: {mean_loc}")
+
+        ground_scores = [r["grounding"] for r in reports]
+        mean_ground = {
+            "parse_rate": float(np.mean([g["parsed"] for g in ground_scores]))
+                          if ground_scores else float("nan"),
+            "vs_saliency": float(np.nanmean([g["vs_saliency"] for g in ground_scores]))
+                          if ground_scores else float("nan"),
+            "vs_ground_truth": float(np.nanmean([g["vs_ground_truth"] for g in ground_scores]))
+                          if ground_scores else float("nan"),
+        }
+        print(f"[Grounding/{scen}] mean over {len(ground_scores)} LLM reports: {mean_ground}")
 
         if args.sensitivity:
             sens = {}
