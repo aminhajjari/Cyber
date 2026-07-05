@@ -154,6 +154,68 @@ def localization_score(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 4. Deletion/insertion faithfulness  (ground-truth-FREE, deployment-usable)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def deletion_insertion_score(
+        model: torch.nn.Module,
+        x: np.ndarray,                 # (n_bus, d) single RAW (unscaled) sample
+        saliency: np.ndarray,          # (n_bus,) from bus_saliency
+        scaler_X,
+        head: str = "cls",
+        k_frac: float = 0.15,          # fraction of buses to perturb
+        device: Optional[str] = None,
+) -> Dict[str, float]:
+    """
+    Perturbation-based faithfulness check for the SAME saliency map that feeds
+    the LLM report, but -- unlike localization_score() -- it needs no ground
+    truth. localization_score can only be computed in simulation (where the
+    true falsified buses are known); this metric can be computed on every
+    live alert in deployment, giving a continuous sanity check on whether the
+    model (and therefore the LLM's account of it) is telling a
+    self-consistent story.
+
+    Deletion: zero out the top-k salient buses (replace with the standardized
+    baseline) and see how much the attack logit DROPS. A faithful saliency map
+    should cause a large drop.
+    Insertion: start from an all-baseline sample and insert ONLY the top-k
+    salient buses' real values; see how much of the original logit is
+    RECOVERED. A faithful map should recover most of it from few buses.
+    """
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device).eval()
+
+    n_bus, d = x.shape
+    k = max(1, int(round(k_frac * n_bus)))
+    top_idx = np.ascontiguousarray(np.argsort(saliency)[::-1][:k])
+
+    xs = scaler_X.transform(x.reshape(1, -1)).reshape(1, n_bus, d)
+    x_t = torch.tensor(xs, dtype=torch.float32, device=device)
+    baseline = torch.zeros_like(x_t)
+
+    def _logit(t):
+        with torch.no_grad():
+            reg_out, cls_out = model(t)
+            return float((cls_out if head == "cls" else reg_out).item())
+
+    full_logit = _logit(x_t)
+
+    x_del = x_t.clone()
+    x_del[0, top_idx, :] = baseline[0, top_idx, :]
+    del_logit = _logit(x_del)
+
+    x_ins = baseline.clone()
+    x_ins[0, top_idx, :] = x_t[0, top_idx, :]
+    ins_logit = _logit(x_ins)
+
+    base_logit = _logit(baseline)
+    denom = max(1e-6, full_logit - base_logit)
+    drop_frac      = float(np.clip((full_logit - del_logit) / denom, -5, 5))
+    recovered_frac = float(np.clip((ins_logit - base_logit) / denom, -5, 5))
+    return {"drop_frac": drop_frac, "recovered_frac": recovered_frac, "k": k}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # self-test  (run: python improvements.py)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -218,4 +280,11 @@ if __name__ == "__main__":
     print(f"[OK] saliency shape {sal.shape}, top-4 buses {top4}")
     print(f"[OK] localization {loc}  (attacked buses were {attacked})")
     assert loc["recall@k"] >= 0.5, "saliency failed to localize planted buses"
+
+    # --- test 4: deletion/insertion agrees with localization on same sample --
+    di = deletion_insertion_score(net, X[pos_i], sal, sc, head="cls",
+                                   k_frac=4 / n_bus, device="cpu")
+    print(f"[OK] deletion/insertion {di}")
+    assert di["drop_frac"] > 0.1, "deleting top-saliency buses barely changed the logit"
+
     print("\nAll improvements.py self-tests passed.")
