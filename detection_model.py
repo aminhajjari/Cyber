@@ -51,14 +51,29 @@ def build_input_tensor(
         theta:             np.ndarray,   # (T, n_bus) phase angles
         t_pred:            int,          # current time step (T_pred)
         T_m:               int = T_MONITORING,
-        feature_set:       str = "full"  # "PV" | "PVtheta" | "full"
+        feature_set:       str = "full"  # "PV" | "PVtheta" | "full" | "network_only"
 ) -> np.ndarray:
     """
     Build input tensor x^i for one observation (eq. 3a-3b).
     Monitoring window: [t_pred - T_m - T_pred_ahead, t_pred - T_pred_ahead].
 
+    feature_set:
+      "PV"           -> dispatch/curtail/storage pairs + V_mag
+      "PVtheta"      -> dispatch/curtail/storage pairs + V_mag + theta
+      "full"         -> same as "PVtheta" (all features)
+      "network_only" -> ABLATION: drops the hat/meas dispatch pairs entirely,
+                        keeps ONLY V_mag + theta. Use this to check whether
+                        detection is coming from genuine spatial/temporal
+                        network patterns or is trivially reading the
+                        predicted-vs-actual dispatch mismatch (which is close
+                        to a direct attack indicator by construction). If
+                        accuracy collapses under "network_only", the "full"
+                        result's near-100% accuracy is largely explained by
+                        that mismatch signal rather than learned attack
+                        dynamics -- an important thing to report honestly.
+
     Returns: (n_bus, d) array
-      where d = n_features × T_m
+      where d = n_features x T_m
     """
     n_bus = gen_dispatch_hat.shape[1]
     T_m_start = max(0, t_pred - T_PRED_AHEAD - T_m)
@@ -71,20 +86,21 @@ def build_input_tensor(
     features_per_bus = []
     for n in range(n_bus):
         feat = []
-        # Gen dispatch (predicted + actual)
-        feat.append(gen_dispatch_hat [T_m_start:T_m_end, n])
-        feat.append(gen_dispatch_meas[T_m_start:T_m_end, n])
-        # Load curtailment
-        feat.append(curtail_hat [T_m_start:T_m_end, n])
-        feat.append(curtail_meas[T_m_start:T_m_end, n])
-        # Storage
-        feat.append(stor_hat [T_m_start:T_m_end, n])
-        feat.append(stor_meas[T_m_start:T_m_end, n])
+        if feature_set != "network_only":
+            # Gen dispatch (predicted + actual)
+            feat.append(gen_dispatch_hat [T_m_start:T_m_end, n])
+            feat.append(gen_dispatch_meas[T_m_start:T_m_end, n])
+            # Load curtailment
+            feat.append(curtail_hat [T_m_start:T_m_end, n])
+            feat.append(curtail_meas[T_m_start:T_m_end, n])
+            # Storage
+            feat.append(stor_hat [T_m_start:T_m_end, n])
+            feat.append(stor_meas[T_m_start:T_m_end, n])
         # Voltage magnitude
-        if feature_set in ("PVtheta", "full", "PV"):
+        if feature_set in ("PVtheta", "full", "PV", "network_only"):
             feat.append(V_mag[T_m_start:T_m_end, n])
         # Phase angle
-        if feature_set in ("PVtheta", "full"):
+        if feature_set in ("PVtheta", "full", "network_only"):
             feat.append(theta[T_m_start:T_m_end, n])
 
         features_per_bus.append(np.concatenate(feat))  # (d,)
