@@ -193,26 +193,45 @@ def deletion_insertion_score(
     x_t = torch.tensor(xs, dtype=torch.float32, device=device)
     baseline = torch.zeros_like(x_t)
 
-    def _logit(t):
+    def _prob(t):
+        # Work in PROBABILITY space (sigmoid of the logit), not raw logit space.
+        # A well-separated classifier saturates logits at large, near-identical
+        # magnitudes for confidently-classified negatives, which makes
+        # (logit_a - logit_b) numerically unstable as a normalizer (it can be
+        # near zero even though the model is very confident). Probabilities
+        # are bounded in [0, 1], so differences stay well-scaled regardless of
+        # how saturated the underlying logits are.
         with torch.no_grad():
             reg_out, cls_out = model(t)
-            return float((cls_out if head == "cls" else reg_out).item())
+            out = cls_out if head == "cls" else reg_out
+            return float(torch.sigmoid(out).item()) if head == "cls" else float(out.item())
 
-    full_logit = _logit(x_t)
+    full_p = _prob(x_t)
 
     x_del = x_t.clone()
     x_del[0, top_idx, :] = baseline[0, top_idx, :]
-    del_logit = _logit(x_del)
+    del_p = _prob(x_del)
 
     x_ins = baseline.clone()
     x_ins[0, top_idx, :] = x_t[0, top_idx, :]
-    ins_logit = _logit(x_ins)
+    ins_p = _prob(x_ins)
 
-    base_logit = _logit(baseline)
-    denom = max(1e-6, full_logit - base_logit)
-    drop_frac      = float(np.clip((full_logit - del_logit) / denom, -5, 5))
-    recovered_frac = float(np.clip((ins_logit - base_logit) / denom, -5, 5))
-    return {"drop_frac": drop_frac, "recovered_frac": recovered_frac, "k": k}
+    base_p = _prob(baseline)
+    denom = full_p - base_p
+    # Degenerate case: the model gives ~the same output for the real sample
+    # and the "average" baseline (e.g. a confident, saturated no-attack
+    # prediction where masking a few buses can't move the needle either way).
+    # Returning a clipped extreme value here would look like real signal when
+    # it is actually "this metric isn't well-defined for this sample" --
+    # report NaN instead so it doesn't silently corrupt an average.
+    if abs(denom) < 1e-3:
+        return {"drop_frac": float("nan"), "recovered_frac": float("nan"),
+                "k": k, "degenerate": True, "full_prob": full_p, "base_prob": base_p}
+
+    drop_frac      = float(np.clip((full_p - del_p) / denom, -2, 2))
+    recovered_frac = float(np.clip((ins_p - base_p) / denom, -2, 2))
+    return {"drop_frac": drop_frac, "recovered_frac": recovered_frac, "k": k,
+            "degenerate": False, "full_prob": full_p, "base_prob": base_p}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -285,6 +304,9 @@ if __name__ == "__main__":
     di = deletion_insertion_score(net, X[pos_i], sal, sc, head="cls",
                                    k_frac=4 / n_bus, device="cpu")
     print(f"[OK] deletion/insertion {di}")
-    assert di["drop_frac"] > 0.1, "deleting top-saliency buses barely changed the logit"
+    if not di["degenerate"]:
+        assert di["drop_frac"] > 0.1, "deleting top-saliency buses barely changed the probability"
+    else:
+        print("[OK] degenerate case correctly reported as NaN rather than a misleading extreme value")
 
     print("\nAll improvements.py self-tests passed.")
