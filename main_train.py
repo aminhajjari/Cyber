@@ -23,7 +23,8 @@ from power_flow      import BackwardForwardSweep, generate_daily_profiles
 from attack_model    import AttackSimulator
 from detection_model import DetectionModelTrainer, SVRDetector, build_dataset
 from llm_explainer   import (LLMExplainer, build_attack_context,
-                              parse_structured_report, grounding_score)
+                              parse_structured_report, grounding_score,
+                              check_confidence_faithfulness)
 from detection_model import build_input_tensor
 from improvements    import (bus_saliency, localization_score, group_split_by_day,
                               deletion_insertion_score)
@@ -195,26 +196,57 @@ def main():
         print_table(metrics, scen)
 
         # ── LLM interpretability on the DETECTOR'S decision ──────────────────
-        # Pick 3 cases: successful attacks first; for S2 (rarely "successful")
-        # fall back to the days with the strongest falsification signature.
-        # Index-based selection — AttackResult holds numpy arrays, so
-        # `res in list` would raise "truth value of an array is ambiguous".
-        succ_idx = [i for i, r in enumerate(atk_r) if r.attack_success]
-        if len(succ_idx) < 3:
-            strength = lambda i: (np.abs(atk_r[i].falsification_signal).sum()
-                                  if atk_r[i].falsification_signal is not None else 0.0)
-            extra = sorted([i for i in range(len(atk_r)) if i not in succ_idx],
-                           key=strength, reverse=True)
-            sel = (succ_idx + extra)[:3]
-        else:
-            sel = succ_idx[:3]
-        interesting = [atk_r[i] for i in sel]
+        # Pick 3 cases the CLASSIFIER itself actually flagged (attack_prob
+        # above 0.5), not just days where the attack succeeded physically.
+        # These are NOT the same thing: a day can be a "successful" attack
+        # (margin exhausted) while the classifier still assigns near-zero
+        # probability at the specific hour we sample, which would have us
+        # asking the LLM to narrate a confident incident report for an hour
+        # the model itself saw nothing anomalous in -- exactly the mismatch
+        # check_confidence_faithfulness() below is there to catch, but better
+        # to select genuine detections in the first place so this demo
+        # actually reflects the model's own decisions.
+        tmin = T_MONITORING + T_PRED_AHEAD
+
+        def _clf_hour_and_prob(res):
+            """Return (best_hour, best_prob) among candidate alert hours for res,
+            or (None, 0.0) if no valid monitoring window exists."""
+            best_h, best_p = None, -1.0
+            for h in range(tmin, len(res.system_margin_true)):
+                zeros = np.zeros_like(res.original_dispatch)
+                xs = build_input_tensor(
+                    gen_dispatch_hat=res.original_dispatch,
+                    gen_dispatch_meas=res.falsified_dispatch,
+                    curtail_hat=zeros, curtail_meas=zeros,
+                    stor_hat=zeros, stor_meas=zeros,
+                    V_mag=pf_all[res.day]["V_mag"], theta=pf_all[res.day]["theta"],
+                    t_pred=h, T_m=T_MONITORING, feature_set=args.feature_set)
+                if xs is None:
+                    continue
+                p = float(cnn.predict_proba(xs[None, ...])[0])
+                if p > best_p:
+                    best_h, best_p = h, p
+            return best_h, best_p
+
+        candidates = []
+        for i, r in enumerate(atk_r):
+            h, p = _clf_hour_and_prob(r)
+            if h is not None:
+                candidates.append((i, h, p))
+        candidates.sort(key=lambda t: t[2], reverse=True)
+        detected = [(i, h, p) for i, h, p in candidates if p > 0.5][:3]
+        if len(detected) < 3:
+            print(f"[Interpretability/{scen}] WARNING: only {len(detected)}/3 "
+                  f"sampled days had ANY hour where the classifier's own "
+                  f"probability exceeded 0.5 -- falling back to the "
+                  f"highest-probability hours available even though the "
+                  f"detector itself was not confident there either. This is "
+                  f"itself worth reporting, not hiding.")
+            detected = candidates[:3]
+        interesting = [(atk_r[i], h) for i, h, _ in detected]
 
         reports, loc_scores = [], []
-        tmin = T_MONITORING + T_PRED_AHEAD
-        for res in interesting:
-            alert_h = int(min(23, max(tmin, (res.outage_time or 16) - 2)))
-
+        for res, alert_h in interesting:
             zeros = np.zeros_like(res.original_dispatch)
             x_sample = build_input_tensor(
                 gen_dispatch_hat=res.original_dispatch,
@@ -263,15 +295,23 @@ def main():
 
             structured = parse_structured_report(report)
             ground = grounding_score(structured, sal_buses, true_atk)
+            faith  = check_confidence_faithfulness(structured, ctx)
             print(f"[Grounding] parsed={ground['parsed']} "
                   f"vs_saliency(Jaccard)={ground['vs_saliency']:.2f} "
                   f"vs_ground_truth(Jaccard)={ground['vs_ground_truth']:.2f}")
+            if faith["mismatch"]:
+                print(f"[FAITHFULNESS WARNING] LLM stated confidence "
+                      f"{faith['llm_confidence']:.2f} contradicts detector's "
+                      f"own probability {faith['detector_confidence']:.2f} "
+                      f"-- treat the detector's number as ground truth, not "
+                      f"the LLM's narrative.")
 
             reports.append({"day": res.day, "hour": alert_h, "report": report,
                             "attack_prob": atk_prob, "pred_margin": pred_margin,
                             "saliency_buses": sal_buses, "localization": loc,
                             "deletion_insertion": di,
                             "structured": structured, "grounding": ground,
+                            "faithfulness": faith,
                             "affected_microgrids": ctx.affected_microgrids})
 
         mean_loc = {m: (float(np.nanmean([s[m] for s in loc_scores]))
