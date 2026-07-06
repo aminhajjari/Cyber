@@ -69,11 +69,19 @@ Respond in TWO parts, in this exact order:
 PART 1 — a single JSON object on its own line, with EXACTLY these keys:
   "attack_location_buses": [list of int bus numbers you believe are compromised],
   "affected_microgrids": [list of MG strings like "MG4"],
-  "severity": one of "Critical", "High", "Medium",
+  "severity": one of "Critical", "High", "Medium", "Low",
   "mechanism_summary": one sentence,
   "confidence_0to1": float
 Only include buses/MGs you can justify from the data given to you below — do not
 guess buses that were not mentioned in the detector output.
+
+CRITICAL RULE ON CONFIDENCE: "confidence_0to1" MUST reflect the detector's own
+reported attack probability given below, not your own narrative certainty. If
+the detector's attack probability is low (e.g. under 30%), you MUST set
+confidence_0to1 low to match it, set severity to "Low", and say explicitly
+that the detector did NOT flag a strong anomaly at this hour -- do not write a
+high-confidence incident report for a case the model itself is uncertain
+about. Do not round a low detector probability up to sound more useful.
 
 PART 2 — the human-readable report, formatted as:
 - ATTACK LOCATION: [specific buses/feeders/DERs/micro-grid(s)]
@@ -144,6 +152,38 @@ def grounding_score(structured: Optional[Dict], saliency_buses: List[int],
     out["vs_ground_truth"] = (_jaccard(claimed, true_attacked_buses)
                               if true_attacked_buses is not None else float("nan"))
     return out
+
+
+def check_confidence_faithfulness(structured: Optional[Dict], ctx: "AttackContext",
+                                   mismatch_tol: float = 0.35) -> Dict:
+    """
+    Deterministic check that the LLM's stated confidence/severity are not
+    contradicting the detector's own attack probability. Prompt instructions
+    alone are not reliable here -- a 7B instruct model can (and, empirically,
+    did in early testing on this project) confidently narrate a "High
+    severity" incident report even when the detector's attack probability was
+    ~0%. This function catches that mismatch in code rather than hoping the
+    model complies, and returns a corrected view that downstream consumers
+    (dashboards, the saved JSON, an operator) should trust over the LLM's raw
+    claim when they disagree.
+    """
+    detector_conf = float(ctx.confidence)
+    if structured is None or "confidence_0to1" not in structured:
+        return {"mismatch": None, "detector_confidence": detector_conf,
+                "llm_confidence": None, "corrected_confidence": detector_conf,
+                "corrected_severity": "Low" if detector_conf < 0.3 else None}
+
+    llm_conf = float(structured["confidence_0to1"])
+    mismatch = abs(llm_conf - detector_conf) > mismatch_tol
+    # The detector's own probability is ground truth for "did the model flag
+    # this," so it always wins on disagreement -- the LLM explains the
+    # decision, it doesn't get to overrule it.
+    corrected_conf = detector_conf
+    corrected_sev  = ("Low" if detector_conf < 0.3 else
+                      "Medium" if detector_conf < 0.7 else None)
+    return {"mismatch": mismatch, "detector_confidence": detector_conf,
+            "llm_confidence": llm_conf, "corrected_confidence": corrected_conf,
+            "corrected_severity": corrected_sev}
 
 
 def _der_type_for_bus(bus_id: int) -> str:
