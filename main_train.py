@@ -171,7 +171,14 @@ def main():
         cfg = {**CNN_CONFIG, "epochs": args.epochs}
         metrics = {}
 
-        cnn_path = os.path.join(MODEL_DIR, f"cnn_{scen}.pkl")
+        # Tag checkpoint filenames with the feature_set (when it's not the
+        # default "full") so an ablation run (e.g. --feature_set network_only)
+        # can't silently overwrite your main results' saved models -- the two
+        # feature sets produce genuinely different-shaped/trained models and
+        # need to coexist on disk for you to compare them.
+        fs_tag = "" if args.feature_set == "full" else f"_{args.feature_set}"
+
+        cnn_path = os.path.join(MODEL_DIR, f"cnn_{scen}{fs_tag}.pkl")
         if args.skip_train and os.path.exists(cnn_path):
             cnn = DetectionModelTrainer.load(cnn_path)
         else:
@@ -180,7 +187,7 @@ def main():
             cnn.save(cnn_path)
         metrics["CNN"] = cnn.evaluate(X_te, y_te, f"CNN/{scen}", lbl_true=lbl_te)
 
-        mlp_path = os.path.join(MODEL_DIR, f"mlp_{scen}.pkl")
+        mlp_path = os.path.join(MODEL_DIR, f"mlp_{scen}{fs_tag}.pkl")
         if args.skip_train and os.path.exists(mlp_path):
             mlp = DetectionModelTrainer.load(mlp_path)
         else:
