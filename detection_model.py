@@ -134,10 +134,27 @@ def build_dataset(attack_results:  list,
             # Which hours have active falsification injected?
             fs = getattr(res, "falsification_signal", None)
             for t_pred in range(T_m + T_PRED_AHEAD, T):
+                # ── LEAKAGE-FREE FEATURE CONSTRUCTION ────────────────────────
+                # The EMS observes (a) its own schedule and (b) the up-link
+                # power measurement, which the attacker has SPOOFED to look
+                # normal. It therefore never sees the true perturbed dispatch.
+                #
+                # Previously `gen_dispatch_meas` was set to res.falsified_dispatch
+                # for attacked samples, i.e. original + delta. Since
+                # `gen_dispatch_hat` is `original`, the detector could recover
+                # delta exactly by subtraction -- a direct read of the
+                # ground-truth attack. That is why every model (even a kernel
+                # SVR with MSE 0.60) scored 100%.
+                #
+                # Both channels are now the SPOOFED/scheduled values, which are
+                # identical for attacked and normal samples. They carry no
+                # attack information whatsoever -- exactly as in the real EMS.
+                # The attack now reaches the detector ONLY through V_mag/theta,
+                # which come from the ATTACKED power flow and which the
+                # attacker does not falsify (Wu et al., Sec. IV-B-3).
                 x = build_input_tensor(
                     gen_dispatch_hat  = res.original_dispatch,
-                    gen_dispatch_meas = (res.falsified_dispatch
-                                         if is_attack else res.original_dispatch),
+                    gen_dispatch_meas = res.monitored_dispatch,
                     curtail_hat  = np.zeros_like(res.original_dispatch),
                     curtail_meas = np.zeros_like(res.original_dispatch),
                     stor_hat     = np.zeros_like(res.original_dispatch),
