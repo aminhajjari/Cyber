@@ -39,6 +39,33 @@ class AttackResult:
     # NEW: which micro-grid(s) are impacted by this attack
     affected_microgrids: List[str] = None
 
+    # ─────────────────────────────────────────────────────────────────────
+    # THREAT-MODEL-CORRECT OBSERVABILITY (Wu et al., Sec. II, Fig. 1)
+    #
+    # The attacker falsifies the down-link dispatch command to the DER AND
+    # the up-link monitoring signal to the EMS *simultaneously*, so that the
+    # EMS monitor sees a normal-looking signal while the physical plant is
+    # perturbed. We must therefore keep these two worlds strictly separate:
+    #
+    #   *_physical   -> what actually happens on the grid (drives power flow).
+    #                   NEVER a detector feature. Used only to (a) solve the
+    #                   attacked power flow and (b) compute the true margin.
+    #   *_monitored  -> what the EMS actually receives on the power channels.
+    #                   Under attack this is SPOOFED to look like the schedule,
+    #                   so it carries NO attack information. This is the only
+    #                   power-channel quantity a detector may consume.
+    #
+    # Voltage magnitude / phase angle are NOT spoofed (Wu, Sec. IV-B-3:
+    # "the attacker falsifies only up-link measurements for power, but not
+    # for voltage"), so the physical attack signature reaches the detector
+    # exclusively through the attacked power flow.
+    # ─────────────────────────────────────────────────────────────────────
+    P_gen_physical:    np.ndarray = None   # (T, n_bus) true DER injection
+    P_load_physical:   np.ndarray = None   # (T, n_bus) true served load
+    P_gen_monitored:   np.ndarray = None   # (T, n_bus) spoofed DER injection
+    P_load_monitored:  np.ndarray = None   # (T, n_bus) spoofed served load
+    monitored_dispatch: np.ndarray = None  # (T, n_bus) spoofed dispatch measurement
+
 
 class DispatchPredictor:
     """
@@ -261,7 +288,8 @@ class AttackSimulator:
                      der_gen_MW: np.ndarray,   # renamed from pv_MW
                      scenario: str = "S1",
                      noise_std: float = 0.0,
-                     target_der_type: str = None  # NEW: "WT"|"PV"|"BM"|None(=all)
+                     target_der_type: str = None,  # NEW: "WT"|"PV"|"BM"|None(=all)
+                     apply_attack: bool = True     # NEW: False -> clean normal day
                      ) -> AttackResult:
         """
         Simulate one day of FDI attack.
@@ -288,7 +316,18 @@ class AttackSimulator:
         elif target_der_type == "BM":
             target_buses = self.predictor.bm_buses
 
-        if scenario == "S1":
+        if not apply_attack:
+            # Clean, genuinely un-attacked day for the NEGATIVE class.
+            # Previously the "normal" days were produced by calling this same
+            # method (which always injected a falsification) and then merely
+            # zeroing the RECORDED signal afterwards -- so the negative class
+            # was secretly attacked in the physics. That made any
+            # attacked-vs-normal comparison invalid. Now delta is exactly zero,
+            # so the physical injections equal the schedule.
+            delta = np.zeros_like(gen_disp)
+            falsified_gen  = gen_disp.copy()
+            falsified_curt = curtail.copy()
+        elif scenario == "S1":
             delta = self.falsifier.falsify_generation(
                 gen_disp, reserve_MW, self.attack_window, self.rng,
                 target_buses=target_buses)
@@ -335,6 +374,33 @@ class AttackSimulator:
         original_dispatch  = gen_disp + stor_disp
         falsified_dispatch = falsified_gen + stor_disp
 
+        # ── THREAT-MODEL-CORRECT OBSERVABILITY ───────────────────────────────
+        # PHYSICAL world (drives the attacked power flow):
+        #   S1: the DERs execute the falsified dispatch command, so their real
+        #       injection deviates from the schedule by delta.
+        #   S2: the loads execute the falsified curtailment command, so the
+        #       real served load deviates from the schedule by -delta.
+        # In both cases delta == 0 outside the attack window, so an attacked
+        # day is physically IDENTICAL to a normal day outside the window --
+        # this keeps the attacked/normal comparison fair and localized.
+        if scenario == "S1":
+            P_gen_physical  = der_gen_MW + delta          # DER output perturbed
+            P_load_physical = load_MW - curtail           # curtailment as scheduled
+        else:  # S2
+            P_gen_physical  = der_gen_MW.copy()           # generation as scheduled
+            P_load_physical = load_MW - falsified_curt    # curtailment perturbed
+
+        # MONITORED world (what the EMS actually receives).
+        # The attacker spoofs the up-link power measurements so that they look
+        # exactly like normal operation. Hence the monitored quantities equal
+        # the SCHEDULED ones and contain NO trace of delta. Feeding these to
+        # the detector is therefore leakage-free by construction: the detector
+        # literally cannot recover delta from them, because the EMS could not
+        # either.
+        P_gen_monitored  = der_gen_MW.copy()
+        P_load_monitored = load_MW - curtail
+        monitored_dispatch = original_dispatch.copy()     # == the schedule
+
         # NEW: identify which micro-grid(s) the attacked buses belong to
         attacked_bus_idx = np.where(np.abs(delta).sum(axis=0) > 1e-6)[0]
         affected_mgs = sorted(set(
@@ -349,6 +415,11 @@ class AttackSimulator:
             original_dispatch=original_dispatch,
             falsified_dispatch=falsified_dispatch,
             falsification_signal=delta,
+            P_gen_physical=P_gen_physical,
+            P_load_physical=P_load_physical,
+            P_gen_monitored=P_gen_monitored,
+            P_load_monitored=P_load_monitored,
+            monitored_dispatch=monitored_dispatch,
             system_margin_true=true_margin,
             system_margin_monitored=monitored_margin,
             attack_feasible=attack_feasible,
