@@ -52,26 +52,53 @@ def parse_args():
     return p.parse_args()
 
 
-def run_power_flow_all(system, load_MW, der_gen_MW):
-    """Power flow for all days/hours. Returns list of {V_mag, theta} per day."""
+def run_power_flow_from_injections(system, P_load_days, P_gen_days, tag=""):
+    """
+    Solve the power flow for an EXPLICIT set of physical injections.
+
+    This replaces the old run_power_flow_all(), which always used the
+    *un-attacked* profiles and was then reused for BOTH the attacked and the
+    normal class -- meaning V_mag/theta were byte-identical across classes and
+    could not possibly carry an attack signature. Here the caller supplies the
+    injections, so we can solve the physics of the attacked world and the
+    normal world separately.
+
+    P_load_days / P_gen_days: (n_days, T, n_bus) physical served load / DER
+    injection. The slack bus (index 0) absorbs the residual imbalance, exactly
+    as the substation would: when an S1 attack suppresses local DER output, the
+    slack must import MORE power, which pushes larger flows down the radial
+    feeder and depresses downstream voltages. That redistribution IS the
+    physical attack signature the CNN is meant to learn.
+
+    Returns list of {V_mag, theta} per day.
+    """
     pf_solver = BackwardForwardSweep(system)
-    n_days, T, n = load_MW.shape
+    n_days, T, n = P_load_days.shape
     results = []
-    print("[PF] Running power flow...")
+    print(f"[PF] Running power flow{tag}...")
     for day in range(n_days):
         day_r = {"V_mag": np.zeros((T, n)), "theta": np.zeros((T, n))}
         for t in range(T):
-            P_l = load_MW[day,t]; Q_l = P_l * 0.3
-            P_g = der_gen_MW[day,t].copy()
-            P_g[0] += max(0, P_l.sum()*1.05 - P_g.sum())
+            P_l = np.maximum(P_load_days[day, t], 0.0)   # served load >= 0
+            Q_l = P_l * 0.3
+            P_g = np.maximum(P_gen_days[day, t].copy(), 0.0)
+            # Substation/slack import to close the balance (+5% loss allowance)
+            P_g[0] += max(0.0, P_l.sum() * 1.05 - P_g.sum())
             Q_g = P_g * 0.1
             pf = pf_solver.solve(P_l, Q_l, P_g, Q_g)
             day_r["V_mag"][t] = pf.V_pu
             day_r["theta"][t] = pf.theta_rad
         results.append(day_r)
-        if (day+1) % 50 == 0:
-            print(f"  PF: {day+1}/{n_days} days")
+        if (day + 1) % 50 == 0:
+            print(f"  PF{tag}: {day+1}/{n_days} days")
     return results
+
+
+def stack_injections(results):
+    """Collect per-day (T, n_bus) physical injections into (n_days, T, n_bus)."""
+    P_load = np.stack([r.P_load_physical for r in results])
+    P_gen  = np.stack([r.P_gen_physical  for r in results])
+    return P_load, P_gen
 
 
 def simulate_attacks(system, storage, load_MW, der_gen_MW, scenario, seed,
@@ -81,11 +108,16 @@ def simulate_attacks(system, storage, load_MW, der_gen_MW, scenario, seed,
     atk_r, norm_r = [], []
     for day in range(n):
         a = simulator.simulate_day(load_MW[day], der_gen_MW[day], scenario,
-                                    target_der_type=target_der_type)
+                                    target_der_type=target_der_type,
+                                    apply_attack=True)
         a.day = day; atk_r.append(a)
-        b = simulator.simulate_day(load_MW[day], der_gen_MW[day], scenario)
-        b.falsification_signal = np.zeros_like(a.falsification_signal
-            if a.falsification_signal is not None else a.original_dispatch)
+        # PAIRED normal day: identical load/DER profile, identical schedule,
+        # but delta == 0. Pairing on the same day is what makes the
+        # attacked-vs-normal comparison fair -- the ONLY difference between
+        # the two samples is the attack itself, not the weather or the load.
+        b = simulator.simulate_day(load_MW[day], der_gen_MW[day], scenario,
+                                    target_der_type=target_der_type,
+                                    apply_attack=False)
         b.day = day; norm_r.append(b)
     feas = sum(r.attack_feasible for r in atk_r)/n
     succ = sum(r.attack_success  for r in atk_r)/n
@@ -142,7 +174,11 @@ def main():
         system, n_days=args.n_days, seed=args.seed)
 
     # ── Power flow ─────────────────────────────────────────────────────────
-    pf_all = run_power_flow_all(system, load_MW, der_gen_MW)
+    # NOTE: the power flow is NO LONGER solved once up-front from the
+    # un-attacked profiles. It is now solved twice PER SCENARIO -- once for the
+    # attacked physical injections and once for the normal ones -- inside the
+    # scenario loop below, because the attacked injections depend on the
+    # scenario (S1 perturbs generation, S2 perturbs served load).
 
     # ── LLM ────────────────────────────────────────────────────────────────
     explainer = LLMExplainer(use_llm=args.use_llm)
@@ -159,7 +195,33 @@ def main():
             system, storage, load_MW, der_gen_MW, scen, args.seed,
             target_der_type=args.target_der)
 
-        X, y, lbl, day = build_dataset(atk_r, norm_r, pf_all, pf_all,
+        # ── ATTACKED vs NORMAL POWER FLOW ──────────────────────────────────
+        # Solve the physics separately for the two worlds. The attacked
+        # injections differ from the normal ones ONLY inside the attack window
+        # (delta == 0 elsewhere), so outside the window the two power flows
+        # coincide and the classes remain fairly matched.
+        Pl_atk,  Pg_atk  = stack_injections(atk_r)
+        Pl_norm, Pg_norm = stack_injections(norm_r)
+        pf_atk  = run_power_flow_from_injections(system, Pl_atk,  Pg_atk,
+                                                 tag=f" [{scen} attacked]")
+        pf_norm = run_power_flow_from_injections(system, Pl_norm, Pg_norm,
+                                                 tag=f" [{scen} normal]")
+
+        # Sanity check: the attacked power flow MUST differ from the normal one,
+        # otherwise V/theta carry no signature and the detector has nothing
+        # legitimate to learn (this was silently true in the old pipeline).
+        dV = np.max([np.max(np.abs(a["V_mag"] - b["V_mag"]))
+                     for a, b in zip(pf_atk, pf_norm)])
+        dTh = np.max([np.max(np.abs(a["theta"] - b["theta"]))
+                      for a, b in zip(pf_atk, pf_norm)])
+        print(f"[PF-check/{scen}] max |dV| = {dV:.6e} pu | "
+              f"max |dtheta| = {dTh:.6e} rad")
+        if dV < 1e-9 and dTh < 1e-9:
+            print(f"[PF-check/{scen}] *** FATAL: attacked and normal power "
+                  f"flows are identical -- V/theta carry NO attack signal. "
+                  f"The detector cannot learn anything physical. ***")
+
+        X, y, lbl, day = build_dataset(atk_r, norm_r, pf_atk, pf_norm,
                                        T_m=T_MONITORING, feature_set=args.feature_set)
         # leakage-free split: all windows of a Monte-Carlo day stay together
         itr, iva, ite = group_split_by_day(day, 0.70, 0.15, seed=args.seed)
@@ -223,10 +285,10 @@ def main():
                 zeros = np.zeros_like(res.original_dispatch)
                 xs = build_input_tensor(
                     gen_dispatch_hat=res.original_dispatch,
-                    gen_dispatch_meas=res.falsified_dispatch,
+                    gen_dispatch_meas=res.monitored_dispatch,
                     curtail_hat=zeros, curtail_meas=zeros,
                     stor_hat=zeros, stor_meas=zeros,
-                    V_mag=pf_all[res.day]["V_mag"], theta=pf_all[res.day]["theta"],
+                    V_mag=pf_atk[res.day]["V_mag"], theta=pf_atk[res.day]["theta"],
                     t_pred=h, T_m=T_MONITORING, feature_set=args.feature_set)
                 if xs is None:
                     continue
@@ -257,10 +319,10 @@ def main():
             zeros = np.zeros_like(res.original_dispatch)
             x_sample = build_input_tensor(
                 gen_dispatch_hat=res.original_dispatch,
-                gen_dispatch_meas=res.falsified_dispatch,
+                gen_dispatch_meas=res.monitored_dispatch,
                 curtail_hat=zeros, curtail_meas=zeros,
                 stor_hat=zeros, stor_meas=zeros,
-                V_mag=pf_all[res.day]["V_mag"], theta=pf_all[res.day]["theta"],
+                V_mag=pf_atk[res.day]["V_mag"], theta=pf_atk[res.day]["theta"],
                 t_pred=alert_h, T_m=T_MONITORING, feature_set=args.feature_set)
             if x_sample is None:
                 continue
@@ -285,7 +347,7 @@ def main():
                                           head="cls", device=None)
 
             class _PF:
-                V_pu = pf_all[res.day]["V_mag"][alert_h]
+                V_pu = pf_atk[res.day]["V_mag"][alert_h]
             ctx = build_attack_context(
                 res, _PF(), alert_h,
                 load_MW[res.day, alert_h], der_gen_MW[res.day, alert_h],
